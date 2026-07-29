@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import re
-import time
 from datetime import datetime
 from io import BytesIO
 
@@ -89,7 +88,6 @@ async def update_drivers_list(context: ContextTypes.DEFAULT_TYPE):
             rows_list.append(f"👤 {d['name']} — 🚛 {d['vehicle']} (ID: {d['telegram_id']})")
         text = "**🚚 Liste des chauffeurs**\n\n" + ("\n".join(rows_list) if rows_list else "Aucun chauffeur approuvé.")
 
-        # Get pinned message id (we stored it in group_settings)
         row = await conn.fetchrow("SELECT drivers_list_msg_id FROM group_settings WHERE group_id = $1", ADMIN_GROUP_ID)
         if not row:
             return
@@ -681,11 +679,11 @@ async def cancel_add(update, context):
     context.user_data.pop('add_art', None)
     return ConversationHandler.END
 
-# ---------- Main (webhook with retry) ----------
+# ---------- Main (webhook mode for Render free tier) ----------
 def main():
-    app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register handlers
+    # -- Register handlers --
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -727,31 +725,19 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_quantity))
 
-    # Webhook mode with retry
+    # -- Webhook mode --
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
     port = int(os.environ.get("PORT", "8443"))
 
     if render_url:
         webhook_url = f"{render_url}/{BOT_TOKEN}"
-        max_retries = 5
-        retry_delay = 10
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                logger.info(f"Attempt {attempt}: starting webhook on port {port}, URL: {webhook_url}")
-                app.run_webhook(
-                    listen="0.0.0.0",
-                    port=port,
-                    url_path=BOT_TOKEN,
-                    webhook_url=webhook_url
-                )
-                break
-            except Exception as e:
-                logger.error(f"Webhook failed: {e}")
-                if attempt == max_retries:
-                    logger.critical("Max retries reached, exiting.")
-                    raise
-                time.sleep(retry_delay)
+        logger.info(f"Starting webhook on port {port}, URL: {webhook_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=BOT_TOKEN,
+            webhook_url=webhook_url
+        )
     else:
         logger.warning("RENDER_EXTERNAL_URL not set, falling back to polling")
         app.run_polling()
