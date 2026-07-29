@@ -679,11 +679,11 @@ async def cancel_add(update, context):
     context.user_data.pop('add_art', None)
     return ConversationHandler.END
 
-# ---------- Main (webhook keeps running) ----------
+# ---------- Main (webhook that actually binds a port) ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # --- Handlers ---
+    # --- Register handlers ---
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -725,28 +725,21 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_quantity))
 
-    # --- Webhook setup (keeps the process alive) ---
+    # --- Webhook mode (binds a port, stays alive) ---
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
     port = int(os.environ.get("PORT", "8443"))
 
     if render_url:
         webhook_url = f"{render_url}/{BOT_TOKEN}"
         logger.info(f"Starting webhook on port {port}, URL: {webhook_url}")
-
-        async def run():
-            await app.initialize()
-            await app.bot.set_webhook(url=webhook_url)
-            await app.start()
-            # Keep the process running forever
-            stop_event = asyncio.Event()
-            await stop_event.wait()
-
-        try:
-            asyncio.run(run())
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-        finally:
-            asyncio.run(app.shutdown())
+        # This call starts the Tornado server, sets the webhook, and blocks forever
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=BOT_TOKEN,
+            webhook_url=webhook_url,
+            drop_pending_updates=True
+        )
     else:
         logger.warning("RENDER_EXTERNAL_URL not set, falling back to polling")
         app.run_polling()
