@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from io import BytesIO
 
@@ -680,11 +681,11 @@ async def cancel_add(update, context):
     context.user_data.pop('add_art', None)
     return ConversationHandler.END
 
-# ---------- Main (webhook mode for Render free tier) ----------
+# ---------- Main (webhook with retry) ----------
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
 
-    # -- Register handlers --
+    # Register handlers
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -726,21 +727,32 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_quantity))
 
-    # --- Webhook mode (Render free tier) ---
+    # Webhook mode with retry
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
     port = int(os.environ.get("PORT", "8443"))
 
     if render_url:
         webhook_url = f"{render_url}/{BOT_TOKEN}"
-        logger.info(f"Starting webhook on port {port}, URL: {webhook_url}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=BOT_TOKEN,
-            webhook_url=webhook_url
-        )
+        max_retries = 5
+        retry_delay = 10
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f"Attempt {attempt}: starting webhook on port {port}, URL: {webhook_url}")
+                app.run_webhook(
+                    listen="0.0.0.0",
+                    port=port,
+                    url_path=BOT_TOKEN,
+                    webhook_url=webhook_url
+                )
+                break
+            except Exception as e:
+                logger.error(f"Webhook failed: {e}")
+                if attempt == max_retries:
+                    logger.critical("Max retries reached, exiting.")
+                    raise
+                time.sleep(retry_delay)
     else:
-        # Fallback to polling (local testing)
         logger.warning("RENDER_EXTERNAL_URL not set, falling back to polling")
         app.run_polling()
 
