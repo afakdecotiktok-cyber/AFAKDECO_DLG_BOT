@@ -679,11 +679,11 @@ async def cancel_add(update, context):
     context.user_data.pop('add_art', None)
     return ConversationHandler.END
 
-# ---------- Main (webhook mode for Render free tier) ----------
+# ---------- Main (webhook keeps running) ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # -- Register handlers --
+    # --- Handlers ---
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -725,19 +725,28 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_quantity))
 
-    # -- Webhook mode --
+    # --- Webhook setup (keeps the process alive) ---
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
     port = int(os.environ.get("PORT", "8443"))
 
     if render_url:
         webhook_url = f"{render_url}/{BOT_TOKEN}"
         logger.info(f"Starting webhook on port {port}, URL: {webhook_url}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=BOT_TOKEN,
-            webhook_url=webhook_url
-        )
+
+        async def run():
+            await app.initialize()
+            await app.bot.set_webhook(url=webhook_url)
+            await app.start()
+            # Keep the process running forever
+            stop_event = asyncio.Event()
+            await stop_event.wait()
+
+        try:
+            asyncio.run(run())
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+        finally:
+            asyncio.run(app.shutdown())
     else:
         logger.warning("RENDER_EXTERNAL_URL not set, falling back to polling")
         app.run_polling()
