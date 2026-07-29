@@ -720,7 +720,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_order$"))
 
     app.add_handler(MessageHandler(
-        filters.Document.MIME_TYPE("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") & filters.Chat(ADMIN_GROUP_ID),
+        filters.Document.FileExtension("xlsx") & filters.Chat(ADMIN_GROUP_ID),
         handle_excel_upload
     ))
 
