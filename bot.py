@@ -106,7 +106,6 @@ async def update_drivers_list(context: ContextTypes.DEFAULT_TYPE):
                     message_thread_id=drivers_topic
                 )
             except Exception:
-                # If edit fails (deleted), send new and pin
                 await send_and_pin_new(context, conn, drivers_topic, text)
         else:
             await send_and_pin_new(context, conn, drivers_topic, text)
@@ -200,7 +199,7 @@ async def process_catalogue_excel(context: ContextTypes.DEFAULT_TYPE, file_bytes
             color_map[c['code']] = c['name']
 
     async with db.acquire() as conn:
-        for row in ws.iter_rows(min_row=2, values_only=True):  # assume header row
+        for row in ws.iter_rows(min_row=2, values_only=True):
             if not row or len(row) < 2:
                 continue
             code_raw = str(row[0]).strip()
@@ -681,11 +680,11 @@ async def cancel_add(update, context):
     context.user_data.pop('add_art', None)
     return ConversationHandler.END
 
-# ---------- Main ----------
+# ---------- Main (webhook mode for Render free tier) ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Driver registration
+    # -- Register handlers --
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -696,7 +695,6 @@ def main():
     )
     app.add_handler(reg_conv)
 
-    # Admin add article (only in admin group)
     add_conv = ConversationHandler(
         entry_points=[CommandHandler("addarticle", add_article_start, filters.Chat(ADMIN_GROUP_ID))],
         states={
@@ -711,29 +709,40 @@ def main():
     )
     app.add_handler(add_conv)
 
-    # Commands
     app.add_handler(CommandHandler("search", search_article, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("updateprice", update_price, filters.Chat(ADMIN_GROUP_ID)))
     app.add_handler(CommandHandler("toggleavail", toggle_avail, filters.Chat(ADMIN_GROUP_ID)))
     app.add_handler(CommandHandler("broadcast", broadcast, filters.Chat(ADMIN_GROUP_ID)))
 
-    # Callbacks
     app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve_|reject_)"))
     app.add_handler(CallbackQueryHandler(select_article, pattern=r"^select_"))
     app.add_handler(CallbackQueryHandler(confirm_order, pattern="^confirm_order$"))
     app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_order$"))
 
-    # Excel uploads (admin group, Excel files)
     app.add_handler(MessageHandler(
         filters.Document.MIME_TYPE("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") & filters.Chat(ADMIN_GROUP_ID),
         handle_excel_upload
     ))
 
-    # Quantity handler (private chat)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_quantity))
 
-    # Start
-    app.run_polling()
+    # --- Webhook mode (Render free tier) ---
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    port = int(os.environ.get("PORT", "8443"))
+
+    if render_url:
+        webhook_url = f"{render_url}/{BOT_TOKEN}"
+        logger.info(f"Starting webhook on port {port}, URL: {webhook_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=BOT_TOKEN,
+            webhook_url=webhook_url
+        )
+    else:
+        # Fallback to polling (local testing)
+        logger.warning("RENDER_EXTERNAL_URL not set, falling back to polling")
+        app.run_polling()
 
 if __name__ == "__main__":
     main()
