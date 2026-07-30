@@ -9,7 +9,14 @@ import asyncpg
 import openpyxl
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -24,7 +31,7 @@ load_dotenv()
 
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://...
+DATABASE_URL = os.getenv("DATABASE_URL")  # Neon connection string
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))  # -1003913405243
 
 # ---------- DB Pool ----------
@@ -74,6 +81,13 @@ async def send_to_topic(context: ContextTypes.DEFAULT_TYPE, topic: str, text: st
         return None
     return await context.bot.send_message(
         chat_id=ADMIN_GROUP_ID, text=text, message_thread_id=topic_id, **kwargs
+    )
+
+# ---------- Driver Keyboard ----------
+def get_driver_keyboard():
+    """Return a keyboard with the Search button."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("🔍 Search")]], resize_keyboard=True, one_time_keyboard=False
     )
 
 # ---------- Driver List ----------
@@ -295,7 +309,10 @@ async def start_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with db.acquire() as conn:
         driver = await conn.fetchrow("SELECT * FROM drivers WHERE telegram_id = $1 AND approved = true", user_id)
         if driver:
-            await update.message.reply_text("Vous êtes déjà enregistré. Utilisez /search pour chercher un article.")
+            await update.message.reply_text(
+                "Vous êtes déjà enregistré. Utilisez le bouton 🔍 Search ou /search <terme>.",
+                reply_markup=get_driver_keyboard()
+            )
             return ConversationHandler.END
         pending = await conn.fetchrow("SELECT * FROM pending_drivers WHERE telegram_id = $1", user_id)
         if pending:
@@ -370,7 +387,11 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await conn.execute("DELETE FROM pending_drivers WHERE telegram_id = $1", target_id)
             await query.message.edit_text(f"✅ {pending['name']} approuvé.")
             try:
-                await context.bot.send_message(chat_id=target_id, text="🎉 Inscription approuvée. Utilisez /search pour commencer.")
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text="🎉 Inscription approuvée. Utilisez le bouton 🔍 Search pour commencer.",
+                    reply_markup=get_driver_keyboard()
+                )
             except:
                 pass
             await update_drivers_list(context)
@@ -382,7 +403,7 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
-# ---------- Search ----------
+# ---------- Search Functions ----------
 async def search_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db = await get_db_pool()
@@ -419,7 +440,7 @@ async def search_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, term, user_id)
 
         if not rows:
-            await update.message.reply_text("Aucun article trouvé.")
+            await update.message.reply_text("Aucun article trouvé.", reply_markup=get_driver_keyboard())
             return
 
         keyboard = []
@@ -433,6 +454,65 @@ async def search_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Résultats pour « {term} »:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+
+# ---------- Easy Search Conversation (from keyboard button) ----------
+SEARCH_TERM = 1
+
+async def search_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Triggered when driver presses the 🔍 Search button."""
+    user_id = update.effective_user.id
+    db = await get_db_pool()
+    async with db.acquire() as conn:
+        driver = await conn.fetchrow("SELECT * FROM drivers WHERE telegram_id = $1 AND approved = true", user_id)
+        if not driver:
+            await update.message.reply_text("Vous n'êtes pas un chauffeur approuvé.")
+            return ConversationHandler.END
+    await update.message.reply_text("Que cherchez-vous ? (tapez le nom, la forme, la dimension…)")
+    return SEARCH_TERM
+
+async def receive_search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    term = update.message.text.strip()
+    if len(term) < 2:
+        await update.message.reply_text("Veuillez entrer au moins 2 caractères. Réessayez :")
+        return SEARCH_TERM
+
+    user_id = update.effective_user.id
+    db = await get_db_pool()
+    async with db.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT a.*,
+                   similarity(a.code, $1) AS sim,
+                   COALESCE(h.cnt, 0) AS personal_orders,
+                   a.popularity,
+                   (5 * similarity(a.code, $1) + 2 * COALESCE(h.cnt, 0) + 0.5 * a.popularity) AS combined_score
+            FROM articles a
+            LEFT JOIN (
+                SELECT article_id, COUNT(*) as cnt
+                FROM orders
+                WHERE driver_id = $2
+                GROUP BY article_id
+            ) h ON h.article_id = a.id
+            WHERE similarity(a.code, $1) > 0.1
+            ORDER BY combined_score DESC
+            LIMIT 5
+        """, term, user_id)
+
+    if not rows:
+        await update.message.reply_text("Aucun article trouvé. Essayez un autre terme.", reply_markup=get_driver_keyboard())
+        return ConversationHandler.END
+
+    keyboard = []
+    for r in rows:
+        avail = "" if r['available'] else " (Non dispo)"
+        label = f"{r['code']} - {r['price']} DZD{avail}"
+        callback = f"select_{r['id']}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=callback)])
+
+    await update.message.reply_text(
+        f"Résultats pour « {term} »:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ConversationHandler.END
 
 # ---------- Order Flow ----------
 async def select_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -679,7 +759,7 @@ async def cancel_add(update, context):
     context.user_data.pop('add_art', None)
     return ConversationHandler.END
 
-# ---------- Main (webhook that actually binds a port) ----------
+# ---------- Main (webhook mode for Render) ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -693,6 +773,16 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_reg)]
     )
     app.add_handler(reg_conv)
+
+    # Easy search conversation (from the 🔍 Search button)
+    search_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Text(["🔍 Search"]), search_button)],
+        states={
+            SEARCH_TERM: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_search_term)],
+        },
+        fallbacks=[]
+    )
+    app.add_handler(search_conv)
 
     add_conv = ConversationHandler(
         entry_points=[CommandHandler("addarticle", add_article_start, filters.Chat(ADMIN_GROUP_ID))],
@@ -708,31 +798,35 @@ def main():
     )
     app.add_handler(add_conv)
 
+    # Command handlers
     app.add_handler(CommandHandler("search", search_article, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("s", search_article, filters.ChatType.PRIVATE))  # alias /s
     app.add_handler(CommandHandler("updateprice", update_price, filters.Chat(ADMIN_GROUP_ID)))
     app.add_handler(CommandHandler("toggleavail", toggle_avail, filters.Chat(ADMIN_GROUP_ID)))
     app.add_handler(CommandHandler("broadcast", broadcast, filters.Chat(ADMIN_GROUP_ID)))
 
+    # Callback handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve_|reject_)"))
     app.add_handler(CallbackQueryHandler(select_article, pattern=r"^select_"))
     app.add_handler(CallbackQueryHandler(confirm_order, pattern="^confirm_order$"))
     app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_order$"))
 
+    # Excel upload handler (only .xlsx files in the admin group)
     app.add_handler(MessageHandler(
         filters.Document.FileExtension("xlsx") & filters.Chat(ADMIN_GROUP_ID),
         handle_excel_upload
     ))
 
+    # Quantity handler (private chat, only when expecting quantity)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_quantity))
 
-    # --- Webhook mode (binds a port, stays alive) ---
+    # --- Webhook mode (Render) ---
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
     port = int(os.environ.get("PORT", "8443"))
 
     if render_url:
         webhook_url = f"{render_url}/{BOT_TOKEN}"
         logger.info(f"Starting webhook on port {port}, URL: {webhook_url}")
-        # This call starts the Tornado server, sets the webhook, and blocks forever
         app.run_webhook(
             listen="0.0.0.0",
             port=port,
