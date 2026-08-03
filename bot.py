@@ -34,8 +34,8 @@ load_dotenv()
 
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
+DATABASE_URL = os.getenv("DATABASE_URL")          # Neon connection string
+ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID")) # -1003913405243
 
 # ---------- DB Pool ----------
 pool = None
@@ -53,7 +53,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- Health check handler ----------
+# ---------- Health check endpoint ----------
 class HealthHandler(tornado.web.RequestHandler):
     def get(self):
         self.set_status(200)
@@ -214,77 +214,27 @@ def parse_article_code(code: str):
         raise ValueError(f"Invalid form_size format: {form_size}")
     return collection, match.group(1).upper(), match.group(2), design, color_code
 
-# ---------- Excel Processing ----------
-async def process_catalogue_excel(context: ContextTypes.DEFAULT_TYPE, file_bytes: bytes):
-    db = await get_db_pool()
-    wb = openpyxl.load_workbook(BytesIO(file_bytes))
-    ws = wb.active
-    successes, errors = 0, []
-    color_map = {}
-    async with db.acquire() as conn:
-        colors = await conn.fetch("SELECT code, name FROM color_codes")
-        for c in colors:
-            color_map[c['code']] = c['name']
-    async with db.acquire() as conn:
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row or len(row) < 2:
-                continue
-            code_raw, price_raw = str(row[0]).strip(), row[1]
-            if not code_raw or price_raw is None:
-                continue
-            try:
-                price = float(price_raw)
-                if price < 0:
-                    errors.append(f"{code_raw}: prix négatif")
-                    continue
-            except:
-                errors.append(f"{code_raw}: prix invalide")
-                continue
-            try:
-                collection, form, dimensions, design, color_code = parse_article_code(code_raw)
-            except Exception as e:
-                errors.append(f"{code_raw}: {str(e)}")
-                continue
-            color_name = color_map.get(color_code)
-            if not color_name:
-                errors.append(f"{code_raw}: couleur inconnue ({color_code})")
-                continue
-            await conn.execute(
-                """INSERT INTO articles (code, collection, form, dimensions, design, color_code, color_name, price)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                   ON CONFLICT (code) DO UPDATE SET
-                       collection = EXCLUDED.collection, form = EXCLUDED.form,
-                       dimensions = EXCLUDED.dimensions, design = EXCLUDED.design,
-                       color_code = EXCLUDED.color_code, color_name = EXCLUDED.color_name,
-                       price = EXCLUDED.price""",
-                code_raw, collection, form, dimensions, design, color_code, color_name, price
-            )
-            successes += 1
-    result_text = f"📤 Import catalogue terminé.\n✅ {successes} articles"
-    if errors:
-        result_text += f"\n❌ {len(errors)} erreurs:\n" + "\n".join(errors[:10])
-    await send_to_topic(context, "logs", result_text)
-
-# ---------- Bulk import (paste) ----------
-BULK_TEXT = 1
-
-async def bulk_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Single-message Bulk Import (/bulkadd) ----------
+async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process /bulkadd with the article list in the same message."""
     if not await admin_only(update):
         await update.message.reply_text("⛔ Only admins can use this command.")
-        return ConversationHandler.END
-    await update.message.reply_text(
-        "📋 Send the article list (one per line: CODE PRICE). Example:\n"
-        "`AKSARAY-C80X2000-0000-0 29000`\n"
-        "Send /cancel to abort."
-    )
-    return BULK_TEXT
+        return
 
-async def bulk_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    lines = text.split('\n')
+    # Get the text after the command
+    text = update.message.text.split(' ', 1)
+    if len(text) < 2:
+        await update.message.reply_text(
+            "📋 Usage: /bulkadd followed by lines of CODE PRICE\n"
+            "Example:\n/bulkadd\nAKSARAY-C80X2000-0000-0 29000\nAKSARAY-O160X220-0000-0 6550"
+        )
+        return
+
+    data = text[1].strip()
+    lines = data.split('\n')
     if not lines:
         await update.message.reply_text("❌ No lines found.")
-        return ConversationHandler.END
+        return
 
     db = await get_db_pool()
     successes, errors = 0, []
@@ -335,16 +285,11 @@ async def bulk_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         successes += 1
 
-    result_text = f"📤 Bulk import complete.\n✅ {successes} articles"
+    result = f"📤 Bulk import complete.\n✅ {successes} articles"
     if errors:
-        result_text += f"\n❌ {len(errors)} errors:\n" + "\n".join(errors[:10])
-    await update.message.reply_text(result_text)
-    await send_to_topic(context, "logs", result_text)
-    return ConversationHandler.END
-
-async def cancel_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bulk import cancelled.")
-    return ConversationHandler.END
+        result += f"\n❌ {len(errors)} errors:\n" + "\n".join(errors[:10])
+    await update.message.reply_text(result)
+    await send_to_topic(context, "logs", result)
 
 # ---------- Admin check ----------
 async def admin_only(update: Update):
@@ -530,7 +475,7 @@ async def receive_search_term(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Résultats pour « {term} »:", reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
-# ---------- Order Flow (abbreviated but complete – use previous functions) ----------
+# ---------- Order Flow ----------
 async def select_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -793,7 +738,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # --- Register all handlers (same as before) ---
+    # --- Register all handlers ---
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -825,13 +770,7 @@ def main():
     )
     app.add_handler(add_conv)
 
-    bulk_conv = ConversationHandler(
-        entry_points=[CommandHandler("bulkadd", bulk_add_start, filters.Chat(ADMIN_GROUP_ID))],
-        states={BULK_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_add_receive)]},
-        fallbacks=[CommandHandler("cancel", cancel_bulk)]
-    )
-    app.add_handler(bulk_conv)
-
+    # Command handlers
     app.add_handler(CommandHandler("search", search_article, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("s", search_article, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("updateprice", update_price, filters.Chat(ADMIN_GROUP_ID)))
@@ -841,12 +780,15 @@ def main():
     async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("pong")
     app.add_handler(CommandHandler("ping", ping, filters.Chat(ADMIN_GROUP_ID)))
+    app.add_handler(CommandHandler("bulkadd", bulk_add, filters.Chat(ADMIN_GROUP_ID)))
 
+    # Callback handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve_|reject_)"))
     app.add_handler(CallbackQueryHandler(select_article, pattern=r"^select_"))
     app.add_handler(CallbackQueryHandler(confirm_order, pattern="^confirm_order$"))
     app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_order$"))
 
+    # Quantity handler for private chat
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_quantity))
 
     app.add_error_handler(error_handler)
@@ -862,7 +804,6 @@ def main():
 
     webhook_url = f"{render_url}/{BOT_TOKEN}"
 
-    # Create Tornado application with health and webhook routes
     tornado_app = tornado.web.Application([
         (r"/health", HealthHandler),
         (f"/{BOT_TOKEN}", WebhookHandler, dict(app=app, webhook_url=webhook_url)),
@@ -874,7 +815,6 @@ def main():
         server = tornado.httpserver.HTTPServer(tornado_app)
         server.listen(port)
         logger.info(f"Webhook server started on port {port} with /health endpoint")
-        # Keep the process alive
         stop_event = asyncio.Event()
         await stop_event.wait()
 
