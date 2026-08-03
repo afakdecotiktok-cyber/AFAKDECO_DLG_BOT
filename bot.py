@@ -26,8 +26,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import TelegramError
-import tornado.web
 
 load_dotenv()
 
@@ -85,12 +83,6 @@ async def send_to_topic(context: ContextTypes.DEFAULT_TYPE, topic: str, text: st
     return await context.bot.send_message(
         chat_id=ADMIN_GROUP_ID, text=text, message_thread_id=topic_id, **kwargs
     )
-
-# ---------- Health check endpoint for Render / UptimeRobot ----------
-class HealthHandler(tornado.web.RequestHandler):
-    def get(self):
-        self.set_status(200)
-        self.write("OK")
 
 # ---------- Driver Keyboard ----------
 def get_driver_keyboard():
@@ -714,7 +706,7 @@ async def cancel_add(update, context):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
-# ---------- Main (webhook + health check) ----------
+# ---------- Main (simple webhook, no manual Tornado) ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -772,41 +764,23 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    # --- Webhook mode with health check ---
-    port = int(os.environ.get("PORT", "10000"))
+    # --- Webhook mode (Render) ---
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
-    if not render_url:
-        logger.warning("No RENDER_EXTERNAL_URL, falling back to polling")
-        app.run_polling()
-        return
+    port = int(os.environ.get("PORT", "8443"))
 
-    webhook_url = f"{render_url}/{BOT_TOKEN}"
-
-    # Manually build the Tornado application so we can add /health
-    from telegram.ext import Updater
-    updater = Updater(bot=app.bot, update_queue=app.update_queue)
-    tornado_app = updater._build_tornado_app(webhook_url, app, port, BOT_TOKEN)
-    tornado_app.add_handlers(r".*", [(r"/health", HealthHandler)])
-
-    async def start():
-        await app.initialize()
-        await app.bot.set_webhook(url=webhook_url)
-        await updater.start_webhook(
+    if render_url:
+        webhook_url = f"{render_url}/{BOT_TOKEN}"
+        logger.info(f"Starting webhook on port {port}, URL: {webhook_url}")
+        app.run_webhook(
             listen="0.0.0.0",
             port=port,
             url_path=BOT_TOKEN,
             webhook_url=webhook_url,
-            drop_pending_updates=True,
+            drop_pending_updates=True
         )
-        await updater._started.wait()
-        await updater._stop_event.wait()
-
-    try:
-        asyncio.run(start())
-    except KeyboardInterrupt:
-        pass
-    finally:
-        asyncio.run(app.shutdown())
+    else:
+        logger.warning("RENDER_EXTERNAL_URL not set, falling back to polling")
+        app.run_polling()
 
 if __name__ == "__main__":
     main()
