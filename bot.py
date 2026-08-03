@@ -176,7 +176,7 @@ def parse_article_code(code: str):
     if len(parts) != 4:
         raise ValueError("Code must have 4 parts separated by '-'")
     collection = parts[0]
-    form_size = parts[1]          # e.g. S57X200
+    form_size = parts[1]
     design = parts[2]
     color_code = parts[3]
     match = re.match(r'^([A-Za-z]+)(\d+X\d+)$', form_size)
@@ -235,33 +235,71 @@ async def process_catalogue_excel(context: ContextTypes.DEFAULT_TYPE, file_bytes
         result_text += f"\n❌ {len(errors)} erreurs:\n" + "\n".join(errors[:10])
     await send_to_topic(context, "logs", result_text)
 
-# ---------- Debug Excel Handler (broad filter) ----------
+# ---------- REBUILT Excel Upload Handler (never silent) ----------
 async def handle_excel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Document reçu, vérification...")
+    """
+    This handler replies at every step, so we always see what happened.
+    It catches ANY document in the admin group.
+    """
+    # 1. Confirm we received something
+    await update.message.reply_text("🔍 [Upload] Message received by bot.")
+
+    # 2. Check admin
     if not await admin_only(update):
-        await update.message.reply_text("⛔ Seuls les admins peuvent téléverser.")
+        await update.message.reply_text("⛔ [Upload] Only admins can upload files.")
         return
+
+    # 3. Check if it's a document
     doc = update.message.document
     if not doc:
-        await update.message.reply_text("❌ Aucun document trouvé.")
+        # maybe it's a photo or something else
+        if update.message.photo:
+            await update.message.reply_text("❌ [Upload] Photos are not accepted. Send as a Document (.xlsx).")
+        elif update.message.text:
+            await update.message.reply_text(f"ℹ️ [Upload] Text received: \"{update.message.text}\". Please send an Excel file.")
+        else:
+            await update.message.reply_text("❌ [Upload] No document found in this message.")
         return
+
+    # 4. File name
     file_name = doc.file_name or "inconnu"
-    await update.message.reply_text(f"📄 Nom du fichier : {file_name}")
+    await update.message.reply_text(f"📄 [Upload] File name: {file_name}")
+
+    # 5. Extension check
     if not file_name.lower().endswith(".xlsx"):
-        await update.message.reply_text("❌ Seuls les fichiers .xlsx sont acceptés.")
+        await update.message.reply_text("❌ [Upload] Only .xlsx files are accepted.")
         return
+
+    # 6. Topic check
     thread_id = update.message.message_thread_id
     topics = await get_topics()
-    if thread_id != topics.get("catalogue"):
+    catalogue_id = topics.get("catalogue")
+    if thread_id != catalogue_id:
         await update.message.reply_text(
-            f"ℹ️ Ce fichier doit être envoyé dans le sujet Catalogue Upload "
-            f"(ID: {topics.get('catalogue')}). Ici, topic ID = {thread_id}"
+            f"ℹ️ [Upload] Wrong topic. Upload in Catalogue Upload topic (ID: {catalogue_id}). "
+            f"Current topic ID: {thread_id}"
         )
         return
-    await update.message.reply_text("🔄 Traitement du fichier...")
+
+    # 7. Process the file
+    await update.message.reply_text("🔄 [Upload] Processing file...")
     file = await doc.get_file()
     file_bytes = await file.download_as_bytearray()
     await process_catalogue_excel(context, file_bytes)
+
+# ---------- Fallback handler (logs any non‑command message in admin group) ----------
+async def fallback_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Just log that we got an update, helps debugging."""
+    logger.info(f"Fallback handler triggered: {update}")
+    if update.message:
+        content = "unknown"
+        if update.message.text:
+            content = f"text: {update.message.text}"
+        elif update.message.document:
+            content = f"document: {update.message.document.file_name}"
+        elif update.message.photo:
+            content = "photo"
+        await update.message.reply_text(f"⚠️ [Fallback] Unhandled message: {content}")
 
 # ---------- Admin check ----------
 async def admin_only(update: Update):
@@ -710,7 +748,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # --- Register all handlers ---
+    # Register all handlers (order matters: more specific first)
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -742,24 +780,37 @@ def main():
     )
     app.add_handler(add_conv)
 
+    # Command handlers (must come before the broad document/fallback handlers)
     app.add_handler(CommandHandler("search", search_article, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("s", search_article, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("updateprice", update_price, filters.Chat(ADMIN_GROUP_ID)))
     app.add_handler(CommandHandler("toggleavail", toggle_avail, filters.Chat(ADMIN_GROUP_ID)))
     app.add_handler(CommandHandler("removearticle", remove_article, filters.Chat(ADMIN_GROUP_ID)))
     app.add_handler(CommandHandler("broadcast", broadcast, filters.Chat(ADMIN_GROUP_ID)))
+    # Add a simple /ping command for testing
+    async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("pong")
+    app.add_handler(CommandHandler("ping", ping, filters.Chat(ADMIN_GROUP_ID)))
 
+    # Callback handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve_|reject_)"))
     app.add_handler(CallbackQueryHandler(select_article, pattern=r"^select_"))
     app.add_handler(CallbackQueryHandler(confirm_order, pattern="^confirm_order$"))
     app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_order$"))
 
-    # Broad document filter for debugging Excel upload
+    # --- ULTRA-ROBUST Document handler for admin group (catches any document) ---
     app.add_handler(MessageHandler(
         filters.Document.ALL & filters.Chat(ADMIN_GROUP_ID),
         handle_excel_upload
     ))
 
+    # --- Fallback: catch any other message (text, photo, etc.) in admin group and reply ---
+    app.add_handler(MessageHandler(
+        filters.ALL & filters.Chat(ADMIN_GROUP_ID) & ~filters.COMMAND,
+        fallback_log
+    ))
+
+    # Quantity handler for private chat (only when expecting quantity)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_quantity))
 
     app.add_error_handler(error_handler)
