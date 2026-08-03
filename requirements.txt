@@ -3,3 +3,4 @@ python-dotenv
 asyncpg
 Pillow
 openpyxl
+tornado==6.3.3
