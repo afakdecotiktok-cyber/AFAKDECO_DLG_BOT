@@ -8,7 +8,6 @@ from io import BytesIO
 
 import asyncpg
 import openpyxl
-import tornado.web
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 from telegram import (
@@ -51,12 +50,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# ---------- Health check endpoint ----------
-class HealthHandler(tornado.web.RequestHandler):
-    def get(self):
-        self.set_status(200)
-        self.write("OK")
 
 # ---------- Topic IDs Cache ----------
 topic_cache = None
@@ -243,7 +236,7 @@ async def process_catalogue_excel(context: ContextTypes.DEFAULT_TYPE, file_bytes
         result_text += f"\n❌ {len(errors)} erreurs:\n" + "\n".join(errors[:10])
     await send_to_topic(context, "logs", result_text)
 
-# ---------- REBUILT Excel Upload Handler ----------
+# ---------- Debug Excel Upload Handler ----------
 async def handle_excel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 [Upload] Message received by bot.")
     if not await admin_only(update):
@@ -474,7 +467,8 @@ async def receive_search_term(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Résultats pour « {term} »:", reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
-# ---------- Order Flow ----------
+# ---------- Order Flow (unchanged, included for completeness) ----------
+# (Insert the select_article, handle_quantity, confirm_order, cancel_order functions exactly as before)
 async def select_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -733,11 +727,11 @@ async def cancel_add(update, context):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
-# ---------- Main (webhook + health endpoint) ----------
+# ---------- Main (standard webhook) ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # --- Register all handlers (keep everything exactly as before) ---
+    # --- Register all handlers (exactly as before) ---
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -803,51 +797,23 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    # --- Webhook with health endpoint ---
+    # --- Standard webhook (no custom Tornado) ---
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
     port = int(os.environ.get("PORT", "8443"))
 
-    if not render_url:
-        logger.warning("RENDER_EXTERNAL_URL not set, falling back to polling")
-        app.run_polling()
-        return
-
-    webhook_url = f"{render_url}/{BOT_TOKEN}"
-
-    from telegram.ext import Updater
-    from telegram.ext._webhookhandler import WebhookHandler
-
-    # Custom Tornado application with a health check
-    class CustomTornadoApp(tornado.web.Application):
-        pass
-
-    webhook_handler = WebhookHandler(app, webhook_url)
-    tornado_app = CustomTornadoApp([
-        (r"/health", HealthHandler),          # health endpoint
-        (f"/{BOT_TOKEN}", webhook_handler),   # webhook path
-    ])
-
-    async def start():
-        await app.initialize()
-        await app.bot.set_webhook(url=webhook_url)
-        updater = Updater(bot=app.bot, update_queue=app.update_queue)
-        await updater.start_webhook(
+    if render_url:
+        webhook_url = f"{render_url}/{BOT_TOKEN}"
+        logger.info(f"Starting webhook on port {port}, URL: {webhook_url}")
+        app.run_webhook(
             listen="0.0.0.0",
             port=port,
             url_path=BOT_TOKEN,
             webhook_url=webhook_url,
-            webhook_app=tornado_app,
-            drop_pending_updates=True,
+            drop_pending_updates=True
         )
-        await updater._started.wait()
-        await updater._stop_event.wait()
-
-    try:
-        asyncio.run(start())
-    except KeyboardInterrupt:
-        pass
-    finally:
-        asyncio.run(app.shutdown())
+    else:
+        logger.warning("RENDER_EXTERNAL_URL not set, falling back to polling")
+        app.run_polling()
 
 if __name__ == "__main__":
     main()
