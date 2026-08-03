@@ -8,6 +8,7 @@ from io import BytesIO
 
 import asyncpg
 import openpyxl
+import tornado.web
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 from telegram import (
@@ -50,6 +51,12 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# ---------- Health check endpoint ----------
+class HealthHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.set_status(200)
+        self.write("OK")
 
 # ---------- Topic IDs Cache ----------
 topic_cache = None
@@ -238,7 +245,6 @@ async def process_catalogue_excel(context: ContextTypes.DEFAULT_TYPE, file_bytes
 
 # ---------- REBUILT Excel Upload Handler ----------
 async def handle_excel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Always replies at every step so we never lose sight of what happened."""
     await update.message.reply_text("🔍 [Upload] Message received by bot.")
     if not await admin_only(update):
         await update.message.reply_text("⛔ [Upload] Only admins can upload files.")
@@ -273,7 +279,6 @@ async def handle_excel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ---------- Fallback handler ----------
 async def fallback_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log any non-command message in the admin group."""
     logger.info(f"Fallback handler triggered: {update}")
     if update.message:
         content = "unknown"
@@ -728,22 +733,11 @@ async def cancel_add(update, context):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
-# ---------- Main (webhook with update logger) ----------
+# ---------- Main (webhook + health endpoint) ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ===== UPDATE LOGGER (FIRST, catches everything) =====
-    async def dump_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Log the full update dict to the Logs topic so we can see what Telegram sends."""
-        data = json.dumps(update.to_dict(), indent=2, default=str)
-        logger.info(f"=== RAW UPDATE ===\n{data}")
-        # Also send a snippet to the Logs topic
-        msg = f"🔎 Update type: {update.message}\nFirst 500 chars:\n{data[:500]}"
-        await send_to_topic(context, "logs", msg)
-
-    app.add_handler(MessageHandler(filters.ALL & filters.Chat(ADMIN_GROUP_ID), dump_update), group=-1)
-
-    # --- Register all other handlers (order matters: more specific first) ---
+    # --- Register all handlers (keep everything exactly as before) ---
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -809,23 +803,51 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    # --- Webhook mode (Render) ---
+    # --- Webhook with health endpoint ---
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
     port = int(os.environ.get("PORT", "8443"))
 
-    if render_url:
-        webhook_url = f"{render_url}/{BOT_TOKEN}"
-        logger.info(f"Starting webhook on port {port}, URL: {webhook_url}")
-        app.run_webhook(
+    if not render_url:
+        logger.warning("RENDER_EXTERNAL_URL not set, falling back to polling")
+        app.run_polling()
+        return
+
+    webhook_url = f"{render_url}/{BOT_TOKEN}"
+
+    from telegram.ext import Updater
+    from telegram.ext._webhookhandler import WebhookHandler
+
+    # Custom Tornado application with a health check
+    class CustomTornadoApp(tornado.web.Application):
+        pass
+
+    webhook_handler = WebhookHandler(app, webhook_url)
+    tornado_app = CustomTornadoApp([
+        (r"/health", HealthHandler),          # health endpoint
+        (f"/{BOT_TOKEN}", webhook_handler),   # webhook path
+    ])
+
+    async def start():
+        await app.initialize()
+        await app.bot.set_webhook(url=webhook_url)
+        updater = Updater(bot=app.bot, update_queue=app.update_queue)
+        await updater.start_webhook(
             listen="0.0.0.0",
             port=port,
             url_path=BOT_TOKEN,
             webhook_url=webhook_url,
-            drop_pending_updates=True
+            webhook_app=tornado_app,
+            drop_pending_updates=True,
         )
-    else:
-        logger.warning("RENDER_EXTERNAL_URL not set, falling back to polling")
-        app.run_polling()
+        await updater._started.wait()
+        await updater._stop_event.wait()
+
+    try:
+        asyncio.run(start())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        asyncio.run(app.shutdown())
 
 if __name__ == "__main__":
     main()
