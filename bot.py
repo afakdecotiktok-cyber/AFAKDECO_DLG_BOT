@@ -8,6 +8,8 @@ from io import BytesIO
 
 import asyncpg
 import openpyxl
+import tornado.web
+import tornado.ioloop
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 from telegram import (
@@ -32,8 +34,8 @@ load_dotenv()
 
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")          # Neon connection string
-ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID")) # -1003913405243
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
 
 # ---------- DB Pool ----------
 pool = None
@@ -50,6 +52,33 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# ---------- Health check handler ----------
+class HealthHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.set_status(200)
+        self.write("OK")
+
+# ---------- Custom webhook handler (avoids PTB internals) ----------
+class WebhookHandler(tornado.web.RequestHandler):
+    def initialize(self, app: Application, webhook_url: str) -> None:
+        self.app = app
+        self.webhook_url = webhook_url
+
+    async def post(self) -> None:
+        """Handle incoming Telegram updates."""
+        try:
+            body = self.request.body
+            if not body:
+                self.set_status(400)
+                return
+            data = json.loads(body)
+            update = Update.de_json(data, self.app.bot)
+            asyncio.ensure_future(self.app.process_update(update))
+            self.set_status(200)
+        except Exception as e:
+            logger.error(f"Error processing update: {e}")
+            self.set_status(500)
 
 # ---------- Topic IDs Cache ----------
 topic_cache = None
@@ -177,7 +206,7 @@ def parse_article_code(code: str):
     if len(parts) != 4:
         raise ValueError("Code must have 4 parts separated by '-'")
     collection = parts[0]
-    form_size = parts[1]          # e.g. S57X200
+    form_size = parts[1]
     design = parts[2]
     color_code = parts[3]
     match = re.match(r'^([A-Za-z]+)(\d+X\d+)$', form_size)
@@ -236,52 +265,86 @@ async def process_catalogue_excel(context: ContextTypes.DEFAULT_TYPE, file_bytes
         result_text += f"\n❌ {len(errors)} erreurs:\n" + "\n".join(errors[:10])
     await send_to_topic(context, "logs", result_text)
 
-# ---------- Debug Excel Upload Handler ----------
-async def handle_excel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 [Upload] Message received by bot.")
-    if not await admin_only(update):
-        await update.message.reply_text("⛔ [Upload] Only admins can upload files.")
-        return
-    doc = update.message.document
-    if not doc:
-        if update.message.photo:
-            await update.message.reply_text("❌ [Upload] Photos are not accepted. Send as a Document (.xlsx).")
-        elif update.message.text:
-            await update.message.reply_text(f"ℹ️ [Upload] Text received: \"{update.message.text}\". Please send an Excel file.")
-        else:
-            await update.message.reply_text("❌ [Upload] No document found in this message.")
-        return
-    file_name = doc.file_name or "inconnu"
-    await update.message.reply_text(f"📄 [Upload] File name: {file_name}")
-    if not file_name.lower().endswith(".xlsx"):
-        await update.message.reply_text("❌ [Upload] Only .xlsx files are accepted.")
-        return
-    thread_id = update.message.message_thread_id
-    topics = await get_topics()
-    catalogue_id = topics.get("catalogue")
-    if thread_id != catalogue_id:
-        await update.message.reply_text(
-            f"ℹ️ [Upload] Wrong topic. Upload in Catalogue Upload topic (ID: {catalogue_id}). "
-            f"Current topic ID: {thread_id}"
-        )
-        return
-    await update.message.reply_text("🔄 [Upload] Processing file...")
-    file = await doc.get_file()
-    file_bytes = await file.download_as_bytearray()
-    await process_catalogue_excel(context, file_bytes)
+# ---------- Bulk import (paste) ----------
+BULK_TEXT = 1
 
-# ---------- Fallback handler ----------
-async def fallback_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Fallback handler triggered: {update}")
-    if update.message:
-        content = "unknown"
-        if update.message.text:
-            content = f"text: {update.message.text}"
-        elif update.message.document:
-            content = f"document: {update.message.document.file_name}"
-        elif update.message.photo:
-            content = "photo"
-        await update.message.reply_text(f"⚠️ [Fallback] Unhandled message: {content}")
+async def bulk_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        await update.message.reply_text("⛔ Only admins can use this command.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "📋 Send the article list (one per line: CODE PRICE). Example:\n"
+        "`AKSARAY-C80X2000-0000-0 29000`\n"
+        "Send /cancel to abort."
+    )
+    return BULK_TEXT
+
+async def bulk_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    lines = text.split('\n')
+    if not lines:
+        await update.message.reply_text("❌ No lines found.")
+        return ConversationHandler.END
+
+    db = await get_db_pool()
+    successes, errors = 0, []
+    color_map = {}
+
+    async with db.acquire() as conn:
+        colors = await conn.fetch("SELECT code, name FROM color_codes")
+        for c in colors:
+            color_map[c['code']] = c['name']
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            errors.append(f"Invalid line: {line}")
+            continue
+        code_raw = parts[0]
+        price_raw = parts[1]
+        try:
+            price = float(price_raw)
+            if price < 0:
+                errors.append(f"{code_raw}: negative price")
+                continue
+        except:
+            errors.append(f"{code_raw}: invalid price")
+            continue
+        try:
+            collection, form, dimensions, design, color_code = parse_article_code(code_raw)
+        except Exception as e:
+            errors.append(f"{code_raw}: {str(e)}")
+            continue
+        color_name = color_map.get(color_code)
+        if not color_name:
+            errors.append(f"{code_raw}: unknown color {color_code}")
+            continue
+        async with db.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO articles (code, collection, form, dimensions, design, color_code, color_name, price)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                   ON CONFLICT (code) DO UPDATE SET
+                       collection = EXCLUDED.collection, form = EXCLUDED.form,
+                       dimensions = EXCLUDED.dimensions, design = EXCLUDED.design,
+                       color_code = EXCLUDED.color_code, color_name = EXCLUDED.color_name,
+                       price = EXCLUDED.price""",
+                code_raw, collection, form, dimensions, design, color_code, color_name, price
+            )
+        successes += 1
+
+    result_text = f"📤 Bulk import complete.\n✅ {successes} articles"
+    if errors:
+        result_text += f"\n❌ {len(errors)} errors:\n" + "\n".join(errors[:10])
+    await update.message.reply_text(result_text)
+    await send_to_topic(context, "logs", result_text)
+    return ConversationHandler.END
+
+async def cancel_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bulk import cancelled.")
+    return ConversationHandler.END
 
 # ---------- Admin check ----------
 async def admin_only(update: Update):
@@ -467,8 +530,7 @@ async def receive_search_term(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Résultats pour « {term} »:", reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
-# ---------- Order Flow (unchanged, included for completeness) ----------
-# (Insert the select_article, handle_quantity, confirm_order, cancel_order functions exactly as before)
+# ---------- Order Flow (abbreviated but complete – use previous functions) ----------
 async def select_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -727,11 +789,11 @@ async def cancel_add(update, context):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
-# ---------- Main (standard webhook) ----------
+# ---------- Main (webhook + health endpoint) ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # --- Register all handlers (exactly as before) ---
+    # --- Register all handlers (same as before) ---
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -763,7 +825,13 @@ def main():
     )
     app.add_handler(add_conv)
 
-    # Command handlers
+    bulk_conv = ConversationHandler(
+        entry_points=[CommandHandler("bulkadd", bulk_add_start, filters.Chat(ADMIN_GROUP_ID))],
+        states={BULK_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_add_receive)]},
+        fallbacks=[CommandHandler("cancel", cancel_bulk)]
+    )
+    app.add_handler(bulk_conv)
+
     app.add_handler(CommandHandler("search", search_article, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("s", search_article, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("updateprice", update_price, filters.Chat(ADMIN_GROUP_ID)))
@@ -774,46 +842,48 @@ def main():
         await update.message.reply_text("pong")
     app.add_handler(CommandHandler("ping", ping, filters.Chat(ADMIN_GROUP_ID)))
 
-    # Callback handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve_|reject_)"))
     app.add_handler(CallbackQueryHandler(select_article, pattern=r"^select_"))
     app.add_handler(CallbackQueryHandler(confirm_order, pattern="^confirm_order$"))
     app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_order$"))
 
-    # Document handler (catches any document in admin group)
-    app.add_handler(MessageHandler(
-        filters.Document.ALL & filters.Chat(ADMIN_GROUP_ID),
-        handle_excel_upload
-    ))
-
-    # Fallback for any other message in admin group
-    app.add_handler(MessageHandler(
-        filters.ALL & filters.Chat(ADMIN_GROUP_ID) & ~filters.COMMAND,
-        fallback_log
-    ))
-
-    # Quantity handler for private chat
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_quantity))
 
     app.add_error_handler(error_handler)
 
-    # --- Standard webhook (no custom Tornado) ---
+    # --- Custom webhook with health endpoint ---
+    port = int(os.environ.get("PORT", "10000"))
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
-    port = int(os.environ.get("PORT", "8443"))
 
-    if render_url:
-        webhook_url = f"{render_url}/{BOT_TOKEN}"
-        logger.info(f"Starting webhook on port {port}, URL: {webhook_url}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=BOT_TOKEN,
-            webhook_url=webhook_url,
-            drop_pending_updates=True
-        )
-    else:
-        logger.warning("RENDER_EXTERNAL_URL not set, falling back to polling")
+    if not render_url:
+        logger.warning("No RENDER_EXTERNAL_URL, starting polling...")
         app.run_polling()
+        return
+
+    webhook_url = f"{render_url}/{BOT_TOKEN}"
+
+    # Create Tornado application with health and webhook routes
+    tornado_app = tornado.web.Application([
+        (r"/health", HealthHandler),
+        (f"/{BOT_TOKEN}", WebhookHandler, dict(app=app, webhook_url=webhook_url)),
+    ])
+
+    async def start():
+        await app.initialize()
+        await app.bot.set_webhook(url=webhook_url)
+        server = tornado.httpserver.HTTPServer(tornado_app)
+        server.listen(port)
+        logger.info(f"Webhook server started on port {port} with /health endpoint")
+        # Keep the process alive
+        stop_event = asyncio.Event()
+        await stop_event.wait()
+
+    try:
+        asyncio.run(start())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        asyncio.run(app.shutdown())
 
 if __name__ == "__main__":
     main()
