@@ -274,22 +274,40 @@ async def process_color_update(context: ContextTypes.DEFAULT_TYPE, file_bytes: b
                 count += 1
     await send_to_topic(context, "logs", f"🎨 {count} couleurs mises à jour.")
 
-# ---------- Combined Excel Handler ----------
+# ---------- Combined Excel Handler (DEBUG VERSION) ----------
 async def handle_excel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Always reply first so we know the handler fired
+    await update.message.reply_text("🔍 File received, checking...")
+
     if not await admin_only(update):
+        await update.message.reply_text("⛔ Only admins can upload files.")
         return
+
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text("❌ No document found in this message.")
+        return
+
+    file_name = doc.file_name or "unknown"
+    await update.message.reply_text(f"📄 File name: {file_name}")
+
+    if not file_name.lower().endswith(".xlsx"):
+        await update.message.reply_text("❌ Only .xlsx files are accepted.")
+        return
+
     thread_id = update.message.message_thread_id
-    file = await update.message.document.get_file()
-    file_bytes = await file.download_as_bytearray()
     topics = await get_topics()
-    if thread_id == topics.get("catalogue"):
-        await update.message.reply_text("🔄 Traitement du catalogue...")
-        await process_catalogue_excel(context, file_bytes)
-    elif thread_id == topics.get("price"):
-        await update.message.reply_text("🔄 Mise à jour des couleurs...")
-        await process_color_update(context, file_bytes)
-    else:
+    if thread_id != topics.get("catalogue"):
+        await update.message.reply_text(
+            f"ℹ️ This file should be uploaded in the Catalogue Upload topic "
+            f"(ID: {topics.get('catalogue')}). Current topic ID: {thread_id}"
+        )
         return
+
+    await update.message.reply_text("🔄 Processing file...")
+    file = await doc.get_file()
+    file_bytes = await file.download_as_bytearray()
+    await process_catalogue_excel(context, file_bytes)
 
 # ---------- Admin check ----------
 async def admin_only(update: Update):
@@ -811,7 +829,7 @@ def main():
     app.add_handler(CallbackQueryHandler(confirm_order, pattern="^confirm_order$"))
     app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_order$"))
 
-    # Excel upload handler (only .xlsx files in the admin group)
+    # Excel upload handler (only .xlsx files in the admin group) - DEBUG VERSION
     app.add_handler(MessageHandler(
         filters.Document.FileExtension("xlsx") & filters.Chat(ADMIN_GROUP_ID),
         handle_excel_upload
