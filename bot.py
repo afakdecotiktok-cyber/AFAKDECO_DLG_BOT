@@ -28,14 +28,13 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 import tornado.web
-import tornado.ioloop
 
 load_dotenv()
 
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
+DATABASE_URL = os.getenv("DATABASE_URL")          # Neon connection string
+ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID")) # -1003913405243
 
 # ---------- DB Pool ----------
 pool = None
@@ -185,7 +184,7 @@ def parse_article_code(code: str):
     if len(parts) != 4:
         raise ValueError("Code must have 4 parts separated by '-'")
     collection = parts[0]
-    form_size = parts[1]
+    form_size = parts[1]          # e.g. S57X200
     design = parts[2]
     color_code = parts[3]
     match = re.match(r'^([A-Za-z]+)(\d+X\d+)$', form_size)
@@ -263,8 +262,8 @@ async def handle_excel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     topics = await get_topics()
     if thread_id != topics.get("catalogue"):
         await update.message.reply_text(
-            f"ℹ️ Ce fichier doit être envoyé dans le sujet Catalogue Upload (ID: {topics.get('catalogue')}). "
-            f"Ici, topic ID = {thread_id}"
+            f"ℹ️ Ce fichier doit être envoyé dans le sujet Catalogue Upload "
+            f"(ID: {topics.get('catalogue')}). Ici, topic ID = {thread_id}"
         )
         return
     await update.message.reply_text("🔄 Traitement du fichier...")
@@ -456,10 +455,110 @@ async def receive_search_term(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Résultats pour « {term} »:", reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
-# ---------- Order Flow (unchanged, omitted for brevity, but full file includes all) ----------
-# (Insert all the order functions exactly as they were in the previous full version – select_article, handle_quantity, confirm_order, cancel_order)
-# ... [I'll trust you to copy them from the last full file, they are not shown here due to space but remain identical]
-# For completeness, I'll include them in the final answer but here I'll note they are present.
+# ---------- Order Flow ----------
+async def select_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    article_id = query.data.split('_', 1)[1]
+    db = await get_db_pool()
+    async with db.acquire() as conn:
+        article = await conn.fetchrow("SELECT * FROM articles WHERE id = $1", article_id)
+        if not article:
+            await query.message.reply_text("Article introuvable.")
+            return
+        if not article['available']:
+            await query.message.reply_text("❌ Article non disponible.")
+            return
+        context.user_data['order'] = {
+            'article_id': str(article['id']),
+            'code': article['code'],
+            'price': float(article['price']),
+            'article': article
+        }
+        await query.message.reply_text(
+            f"Article: {article['code']}\nPrix unitaire: {article['price']} DZD\nEntrez la quantité :"
+        )
+
+async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'order' not in context.user_data or 'quantity' in context.user_data['order']:
+        return
+    try:
+        qty = int(update.message.text.strip())
+        if qty <= 0:
+            raise ValueError
+    except:
+        await update.message.reply_text("Quantité invalide. Entrez un nombre positif :")
+        return
+    context.user_data['order']['quantity'] = qty
+    article = context.user_data['order']['article']
+    total = qty * context.user_data['order']['price']
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirmer", callback_data="confirm_order"),
+         InlineKeyboardButton("❌ Annuler", callback_data="cancel_order")]
+    ])
+    await update.message.reply_text(
+        f"Récapitulatif:\nCode: {article['code']}\nCouleur: {article['color_name']}\n"
+        f"Quantité: {qty}\nPrix total: {total:.2f} DZD\nConfirmer ?",
+        reply_markup=keyboard
+    )
+
+async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if 'order' not in context.user_data:
+        return
+    order = context.user_data['order']
+    driver_id = query.from_user.id
+    db = await get_db_pool()
+    async with db.acquire() as conn:
+        driver = await conn.fetchrow("SELECT name, vehicle FROM drivers WHERE telegram_id = $1", driver_id)
+        if not driver:
+            await query.message.edit_text("Erreur: chauffeur non trouvé.")
+            return
+        article = await conn.fetchrow("SELECT * FROM articles WHERE id = $1", order['article_id'])
+        if not article:
+            await query.message.edit_text("Article introuvable.")
+            return
+        order_number = await generate_order_number(conn)
+        unit_price = order['price']
+        qty = order['quantity']
+        total = unit_price * qty
+        await conn.execute(
+            "INSERT INTO orders (order_number, driver_id, article_id, quantity, unit_price, total_price) VALUES ($1, $2, $3, $4, $5, $6)",
+            order_number, driver_id, order['article_id'], qty, unit_price, total
+        )
+        await conn.execute("UPDATE articles SET popularity = popularity + 0.01 WHERE id = $1", order['article_id'])
+        order_data = {
+            'code': article['code'],
+            'collection': article['collection'],
+            'form': article['form'],
+            'dimensions': article['dimensions'],
+            'design': article['design'],
+            'color_name': article['color_name'],
+            'quantity': qty,
+            'unit_price': unit_price,
+            'total_price': total,
+            'order_date': datetime.now()
+        }
+        png = await generate_order_png(order_data)
+        caption = f"🚛 Chauffeur: {driver['name']} — {driver['vehicle']}"
+        topics = await get_topics()
+        orders_topic = topics.get("orders")
+        if orders_topic:
+            await context.bot.send_photo(
+                chat_id=ADMIN_GROUP_ID,
+                photo=InputFile(png, filename=f"order_{order_number}.png"),
+                caption=caption,
+                message_thread_id=orders_topic
+            )
+        await query.message.edit_text(f"✅ Commande {order_number} envoyée.")
+        context.user_data.pop('order', None)
+
+async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.edit_text("Commande annulée.")
+    context.user_data.pop('order', None)
 
 # ---------- Admin Commands ----------
 async def update_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -614,14 +713,12 @@ async def cancel_add(update, context):
 # ---------- Error handler ----------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    if update and isinstance(update, Update):
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Une erreur s'est produite.")
 
 # ---------- Main (webhook + health check) ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register all handlers (as before)
+    # --- Register all handlers ---
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -665,7 +762,7 @@ def main():
     app.add_handler(CallbackQueryHandler(confirm_order, pattern="^confirm_order$"))
     app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_order$"))
 
-    # Broad document filter (catches any document in the admin group)
+    # Broad document filter for debugging Excel upload
     app.add_handler(MessageHandler(
         filters.Document.ALL & filters.Chat(ADMIN_GROUP_ID),
         handle_excel_upload
@@ -675,24 +772,41 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    # Start webhook and add health check route
+    # --- Webhook mode with health check ---
+    port = int(os.environ.get("PORT", "10000"))
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
-    port = int(os.environ.get("PORT", "8443"))
+    if not render_url:
+        logger.warning("No RENDER_EXTERNAL_URL, falling back to polling")
+        app.run_polling()
+        return
 
-    if render_url:
-        webhook_url = f"{render_url}/{BOT_TOKEN}"
-        # Add health check to the Tornado application before running
-        app.run_webhook(
+    webhook_url = f"{render_url}/{BOT_TOKEN}"
+
+    # Manually build the Tornado application so we can add /health
+    from telegram.ext import Updater
+    updater = Updater(bot=app.bot, update_queue=app.update_queue)
+    tornado_app = updater._build_tornado_app(webhook_url, app, port, BOT_TOKEN)
+    tornado_app.add_handlers(r".*", [(r"/health", HealthHandler)])
+
+    async def start():
+        await app.initialize()
+        await app.bot.set_webhook(url=webhook_url)
+        await updater.start_webhook(
             listen="0.0.0.0",
             port=port,
             url_path=BOT_TOKEN,
             webhook_url=webhook_url,
             drop_pending_updates=True,
-            # Extra keyword arguments to pass to the underlying HTTPServer
-            # We'll add the health endpoint by subclassing Application
         )
-    else:
-        app.run_polling()
+        await updater._started.wait()
+        await updater._stop_event.wait()
+
+    try:
+        asyncio.run(start())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        asyncio.run(app.shutdown())
 
 if __name__ == "__main__":
     main()
