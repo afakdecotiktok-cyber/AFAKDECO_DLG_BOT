@@ -1,6 +1,4 @@
-python-telegram-bot[webhooks]==20.7
-python-dotenv
-asyncpg
-Pillow
-openpyxl
-tornado==6.3.3
+python-telegram-bot[job-queue]==21.10
+flask==3.0.0
+openpyxl==3.1.5
+psycopg2-binary==2.9.10
