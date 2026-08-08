@@ -29,7 +29,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import TelegramError
 
 load_dotenv()
 
@@ -73,16 +72,14 @@ def get_color_name(code):
     return COLOR_CACHE.get(code)
 
 # ---------- Admin cache (TTL 60s) ----------
-ADMIN_CACHE: dict[int, tuple[bool, float]] = {}   # user_id -> (is_admin, expiry)
+ADMIN_CACHE: dict[int, tuple[bool, float]] = {}
 
 async def admin_only(update: Update) -> bool:
-    """Check if the user is an admin, using a 60-second cache."""
     user_id = update.effective_user.id
     now = asyncio.get_event_loop().time()
     cached = ADMIN_CACHE.get(user_id)
     if cached and cached[1] > now:
         return cached[0]
-
     try:
         bot = update.get_bot()
         member = await bot.get_chat_member(ADMIN_GROUP_ID, user_id)
@@ -90,7 +87,6 @@ async def admin_only(update: Update) -> bool:
         ADMIN_CACHE[user_id] = (is_admin, now + 60)
         return is_admin
     except Exception:
-        # if we can't check, deny access
         return False
 
 # ---------- DB Pool ----------
@@ -127,7 +123,7 @@ async def get_topics():
                 topic_cache = {}
     return topic_cache
 
-async def send_to_topic(context: ContextTypes.DEFAULT_TYPE, topic: str, text: str, **kwargs):
+async def send_to_topic(context, topic, text, **kwargs):
     topics = await get_topics()
     topic_id = topics.get(topic)
     if not topic_id:
@@ -150,7 +146,7 @@ def get_driver_keyboard():
     )
 
 # ---------- Driver List ----------
-async def update_drivers_list(context: ContextTypes.DEFAULT_TYPE):
+async def update_drivers_list(context):
     db = await get_db_pool()
     async with db.acquire() as conn:
         drivers = await conn.fetch(
@@ -179,9 +175,8 @@ async def send_and_pin_new(context, conn, drivers_topic, text):
     msg = await context.bot.send_message(
         chat_id=ADMIN_GROUP_ID, text=text, parse_mode='Markdown', message_thread_id=drivers_topic
     )
-    await context.bot.pin_chat_message(
-        chat_id=ADMIN_GROUP_ID, message_id=msg.message_id, message_thread_id=drivers_topic, disable_notification=True
-    )
+    # Pinning is skipped because PTB 20.7 does not support message_thread_id in pin_chat_message
+    # We simply send the message without pinning it (the list will still appear in the topic)
     await conn.execute(
         "UPDATE group_settings SET drivers_list_msg_id = $1 WHERE group_id = $2",
         msg.message_id, ADMIN_GROUP_ID
@@ -242,7 +237,6 @@ def parse_article_code(code: str):
 
 # ---------- Batch article insertion ----------
 async def insert_articles_batch(conn, articles_data):
-    """articles_data is a list of tuples (code, collection, form, dimensions, design, color_code, color_name, price)."""
     async with conn.transaction():
         await conn.executemany(
             """INSERT INTO articles (code, collection, form, dimensions, design, color_code, color_name, price)
@@ -255,63 +249,15 @@ async def insert_articles_batch(conn, articles_data):
             articles_data
         )
 
-# ---------- Excel Processing ----------
-async def process_catalogue_excel(context: ContextTypes.DEFAULT_TYPE, file_bytes: bytes):
-    db = await get_db_pool()
-    successes, errors = 0, []
-    batch = []
-    wb = openpyxl.load_workbook(BytesIO(file_bytes))
-    ws = wb.active
-
-    # Load color cache if empty (should already be loaded at startup)
-    if not COLOR_CACHE:
-        await load_color_cache()
-
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row or len(row) < 2:
-            continue
-        code_raw, price_raw = str(row[0]).strip(), row[1]
-        if not code_raw or price_raw is None:
-            continue
-        try:
-            price = float(price_raw)
-            if price < 0:
-                errors.append(f"{code_raw}: prix négatif")
-                continue
-        except:
-            errors.append(f"{code_raw}: prix invalide")
-            continue
-        try:
-            collection, form, dimensions, design, color_code = parse_article_code(code_raw)
-        except Exception as e:
-            errors.append(f"{code_raw}: {str(e)}")
-            continue
-        color_name = get_color_name(color_code)
-        if not color_name:
-            errors.append(f"{code_raw}: couleur inconnue ({color_code})")
-            continue
-        batch.append((code_raw, collection, form, dimensions, design, color_code, color_name, price))
-
-    if batch:
-        async with db.acquire() as conn:
-            try:
-                await insert_articles_batch(conn, batch)
-                successes = len(batch)
-            except Exception as e:
-                logger.error(f"Batch insert failed: {e}")
-                errors.append("Batch insert failed, check logs")
-                successes = 0
-
-    result_text = f"📤 Import catalogue terminé.\n✅ {successes} articles"
-    if errors:
-        result_text += f"\n❌ {len(errors)} erreurs:\n" + "\n".join(errors[:10])
-    await send_to_topic(context, "logs", result_text)
-
 # ---------- Bulk Add (single message) ----------
 async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update):
         await update.message.reply_text("⛔ Only admins can use this command.")
         return
+
+    # Ensure color cache is loaded
+    if not COLOR_CACHE:
+        await load_color_cache()
 
     text = update.message.text.split(' ', 1)
     if len(text) < 2:
@@ -326,9 +272,6 @@ async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not lines:
         await update.message.reply_text("❌ No lines found.")
         return
-
-    if not COLOR_CACHE:
-        await load_color_cache()
 
     batch = []
     errors = []
@@ -373,7 +316,7 @@ async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(result)
     await send_to_topic(context, "logs", result)
 
-# ---------- Driver Registration (unchanged, but uses admin_only) ----------
+# ---------- Driver Registration ----------
 REG_NAME, REG_VEHICLE = range(2)
 
 async def start_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -395,7 +338,7 @@ async def start_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Bienvenue. Entrez votre nom complet :")
         return REG_NAME
 
-async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reg_name(update, context):
     name = update.message.text.strip()
     if not name:
         await update.message.reply_text("Nom invalide. Réessayez :")
@@ -404,7 +347,7 @@ async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Maintenant, le nom de votre véhicule :")
     return REG_VEHICLE
 
-async def reg_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reg_vehicle(update, context):
     vehicle = update.message.text.strip()
     if not vehicle:
         await update.message.reply_text("Nom de véhicule invalide. Réessayez :")
@@ -428,7 +371,7 @@ async def reg_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('reg', None)
     return ConversationHandler.END
 
-async def cancel_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_reg(update, context):
     await update.message.reply_text("Inscription annulée.")
     context.user_data.pop('reg', None)
     return ConversationHandler.END
@@ -471,8 +414,8 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
-# ---------- Search Functions (unchanged) ----------
-async def search_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Search Functions ----------
+async def search_article(update, context):
     user_id = update.effective_user.id
     db = await get_db_pool()
     async with db.acquire() as conn:
@@ -507,10 +450,9 @@ async def search_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(f"{r['code']} - {r['price']} DZD{avail}", callback_data=f"select_{r['id']}")])
         await update.message.reply_text(f"Résultats pour « {term} »:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ---------- Easy Search Conversation ----------
 SEARCH_TERM = 1
 
-async def search_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def search_button(update, context):
     user_id = update.effective_user.id
     db = await get_db_pool()
     async with db.acquire() as conn:
@@ -521,7 +463,7 @@ async def search_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Que cherchez-vous ? (tapez le nom, la forme, la dimension…)")
     return SEARCH_TERM
 
-async def receive_search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_search_term(update, context):
     term = update.message.text.strip()
     if len(term) < 2:
         await update.message.reply_text("Veuillez entrer au moins 2 caractères.")
@@ -550,7 +492,7 @@ async def receive_search_term(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 # ---------- Order Flow (unchanged) ----------
-async def select_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def select_article(update, context):
     query = update.callback_query
     await query.answer()
     article_id = query.data.split('_', 1)[1]
@@ -573,7 +515,7 @@ async def select_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Article: {article['code']}\nPrix unitaire: {article['price']} DZD\nEntrez la quantité :"
         )
 
-async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_quantity(update, context):
     if 'order' not in context.user_data or 'quantity' in context.user_data['order']:
         return
     try:
@@ -596,7 +538,7 @@ async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def confirm_order(update, context):
     query = update.callback_query
     await query.answer()
     if 'order' not in context.user_data:
@@ -648,14 +590,14 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(f"✅ Commande {order_number} envoyée.")
         context.user_data.pop('order', None)
 
-async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_order(update, context):
     query = update.callback_query
     await query.answer()
     await query.message.edit_text("Commande annulée.")
     context.user_data.pop('order', None)
 
 # ---------- Admin Commands ----------
-async def update_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def update_price(update, context):
     if not await admin_only(update):
         return
     args = context.args
@@ -677,7 +619,7 @@ async def update_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Prix mis à jour pour {code}.")
             await send_to_topic(context, "logs", f"💰 Prix changé: {code} -> {price} DZD")
 
-async def toggle_avail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def toggle_avail(update, context):
     if not await admin_only(update):
         return
     if not context.args:
@@ -694,7 +636,7 @@ async def toggle_avail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await conn.execute("UPDATE articles SET available = $1 WHERE code = $2", new, code)
         await update.message.reply_text(f"{code} maintenant {'disponible' if new else 'non disponible'}.")
 
-async def remove_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def remove_article(update, context):
     if not await admin_only(update):
         return
     if not context.args:
@@ -710,7 +652,7 @@ async def remove_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Article {code} supprimé.")
             await send_to_topic(context, "logs", f"🗑️ Article supprimé: {code}")
 
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def broadcast(update, context):
     if not await admin_only(update):
         return
     text = update.message.text.split(' ', 1)
@@ -730,10 +672,10 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
     await update.message.reply_text(f"Diffusion: {sent} envoyés, {failed} échecs.")
 
-# ---------- /addarticle Conversation (with admin cache) ----------
+# ---------- /addarticle Conversation ----------
 ADD_COLLECTION, ADD_FORM, ADD_DIMENSIONS, ADD_DESIGN, ADD_COLOR, ADD_PRICE = range(6)
 
-async def add_article_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_article_start(update, context):
     if not await admin_only(update):
         return ConversationHandler.END
     await update.message.reply_text("Collection (ex: AMIRA):")
@@ -803,7 +745,7 @@ async def cancel_add(update, context):
     return ConversationHandler.END
 
 # ---------- Error handler ----------
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def error_handler(update, context):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
 # ---------- Health endpoint ----------
@@ -812,13 +754,12 @@ class HealthHandler(tornado.web.RequestHandler):
         self.set_status(200)
         self.write("OK")
 
-# ---------- Custom webhook handler ----------
 class WebhookHandler(tornado.web.RequestHandler):
-    def initialize(self, app: Application, webhook_url: str) -> None:
+    def initialize(self, app, webhook_url):
         self.app = app
         self.webhook_url = webhook_url
 
-    async def post(self) -> None:
+    async def post(self):
         try:
             body = self.request.body
             if not body:
@@ -836,13 +777,7 @@ class WebhookHandler(tornado.web.RequestHandler):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Load color cache asynchronously after bot is initialized
-    async def post_init(app):
-        await load_color_cache()
-
-    app.post_init = post_init
-
-    # --- Register all handlers ---
+    # Handlers registration
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -874,7 +809,6 @@ def main():
     )
     app.add_handler(add_conv)
 
-    # Command handlers
     app.add_handler(CommandHandler("search", search_article, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("s", search_article, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("updateprice", update_price, filters.Chat(ADMIN_GROUP_ID)))
@@ -882,27 +816,23 @@ def main():
     app.add_handler(CommandHandler("removearticle", remove_article, filters.Chat(ADMIN_GROUP_ID)))
     app.add_handler(CommandHandler("broadcast", broadcast, filters.Chat(ADMIN_GROUP_ID)))
     app.add_handler(CommandHandler("bulkadd", bulk_add, filters.Chat(ADMIN_GROUP_ID)))
-    async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def ping(update, context):
         await update.message.reply_text("pong")
     app.add_handler(CommandHandler("ping", ping, filters.Chat(ADMIN_GROUP_ID)))
 
-    # Callback handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve_|reject_)"))
     app.add_handler(CallbackQueryHandler(select_article, pattern=r"^select_"))
     app.add_handler(CallbackQueryHandler(confirm_order, pattern="^confirm_order$"))
     app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_order$"))
-
-    # Quantity handler for private chat
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_quantity))
-
     app.add_error_handler(error_handler)
 
-    # --- Custom webhook with health endpoint ---
+    # Webhook setup with health check and color cache preloading
     port = int(os.environ.get("PORT", "10000"))
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
 
     if not render_url:
-        logger.warning("No RENDER_EXTERNAL_URL, starting polling...")
+        logger.warning("No RENDER_EXTERNAL_URL, falling back to polling")
         app.run_polling()
         return
 
@@ -915,6 +845,8 @@ def main():
 
     async def start():
         await app.initialize()
+        # Load colors before accepting updates
+        await load_color_cache()
         await app.bot.set_webhook(url=webhook_url)
         server = tornado.httpserver.HTTPServer(tornado_app)
         server.listen(port)
