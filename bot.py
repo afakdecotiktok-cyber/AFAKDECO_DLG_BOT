@@ -73,24 +73,25 @@ def get_color_name(code):
     return COLOR_CACHE.get(code)
 
 # ---------- Admin cache (TTL 60s) ----------
-ADMIN_CACHE = {}  # user_id -> (is_admin, expiry)
+ADMIN_CACHE: dict[int, tuple[bool, float]] = {}   # user_id -> (is_admin, expiry)
 
-async def is_admin(user_id: int) -> bool:
+async def admin_only(update: Update) -> bool:
+    """Check if the user is an admin, using a 60-second cache."""
+    user_id = update.effective_user.id
     now = asyncio.get_event_loop().time()
     cached = ADMIN_CACHE.get(user_id)
     if cached and cached[1] > now:
         return cached[0]
+
     try:
-        # get chat member only when necessary
-        app = Application.get_instance()
-        if app:
-            member = await app.bot.get_chat_member(ADMIN_GROUP_ID, user_id)
-            is_admin = member.status in ('administrator', 'creator')
-            ADMIN_CACHE[user_id] = (is_admin, now + 60)
-            return is_admin
-    except:
-        pass
-    return False
+        bot = update.get_bot()
+        member = await bot.get_chat_member(ADMIN_GROUP_ID, user_id)
+        is_admin = member.status in ('administrator', 'creator')
+        ADMIN_CACHE[user_id] = (is_admin, now + 60)
+        return is_admin
+    except Exception:
+        # if we can't check, deny access
+        return False
 
 # ---------- DB Pool ----------
 pool = None
@@ -308,7 +309,7 @@ async def process_catalogue_excel(context: ContextTypes.DEFAULT_TYPE, file_bytes
 
 # ---------- Bulk Add (single message) ----------
 async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
+    if not await admin_only(update):
         await update.message.reply_text("⛔ Only admins can use this command.")
         return
 
@@ -371,10 +372,6 @@ async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result += f"\n❌ {len(errors)} errors:\n" + "\n".join(errors[:10])
     await update.message.reply_text(result)
     await send_to_topic(context, "logs", result)
-
-# ---------- Admin check helper (using cache) ----------
-async def admin_only(update: Update):
-    return await is_admin(update.effective_user.id)
 
 # ---------- Driver Registration (unchanged, but uses admin_only) ----------
 REG_NAME, REG_VEHICLE = range(2)
@@ -440,7 +437,7 @@ async def cancel_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not await is_admin(query.from_user.id):
+    if not await admin_only(update):
         await query.answer("Non autorisé.")
         return
     action, target_id_str = query.data.split('_', 1)
