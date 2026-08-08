@@ -1,15 +1,14 @@
 import asyncio
-import json
 import logging
 import os
 import re
 from datetime import datetime
+from functools import lru_cache
 from io import BytesIO
 
 import asyncpg
 import openpyxl
 import tornado.web
-import tornado.ioloop
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 from telegram import (
@@ -29,13 +28,68 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.error import TelegramError
 
 load_dotenv()
 
-# ---------- Config ----------
+# ---------- Environment validation ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")          # Neon connection string
-ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID")) # -1003913405243
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_GROUP_ID = os.getenv("ADMIN_GROUP_ID")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set in environment")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set in environment")
+if not ADMIN_GROUP_ID:
+    raise RuntimeError("ADMIN_GROUP_ID is not set in environment")
+ADMIN_GROUP_ID = int(ADMIN_GROUP_ID)
+
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ---------- Global color cache ----------
+COLOR_CACHE = {}
+
+async def load_color_cache():
+    """Load all color codes into memory once."""
+    global COLOR_CACHE
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT code, name FROM color_codes")
+            COLOR_CACHE = {row['code']: row['name'] for row in rows}
+        logger.info(f"Color cache loaded with {len(COLOR_CACHE)} entries")
+    except Exception as e:
+        logger.error(f"Failed to load color cache: {e}")
+
+def get_color_name(code):
+    """O(1) color lookup."""
+    return COLOR_CACHE.get(code)
+
+# ---------- Admin cache (TTL 60s) ----------
+ADMIN_CACHE = {}  # user_id -> (is_admin, expiry)
+
+async def is_admin(user_id: int) -> bool:
+    now = asyncio.get_event_loop().time()
+    cached = ADMIN_CACHE.get(user_id)
+    if cached and cached[1] > now:
+        return cached[0]
+    try:
+        # get chat member only when necessary
+        app = Application.get_instance()
+        if app:
+            member = await app.bot.get_chat_member(ADMIN_GROUP_ID, user_id)
+            is_admin = member.status in ('administrator', 'creator')
+            ADMIN_CACHE[user_id] = (is_admin, now + 60)
+            return is_admin
+    except:
+        pass
+    return False
 
 # ---------- DB Pool ----------
 pool = None
@@ -45,40 +99,6 @@ async def get_db_pool():
     if pool is None:
         pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     return pool
-
-# ---------- Logging ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# ---------- Health check endpoint ----------
-class HealthHandler(tornado.web.RequestHandler):
-    def get(self):
-        self.set_status(200)
-        self.write("OK")
-
-# ---------- Custom webhook handler (avoids PTB internals) ----------
-class WebhookHandler(tornado.web.RequestHandler):
-    def initialize(self, app: Application, webhook_url: str) -> None:
-        self.app = app
-        self.webhook_url = webhook_url
-
-    async def post(self) -> None:
-        """Handle incoming Telegram updates."""
-        try:
-            body = self.request.body
-            if not body:
-                self.set_status(400)
-                return
-            data = json.loads(body)
-            update = Update.de_json(data, self.app.bot)
-            asyncio.ensure_future(self.app.process_update(update))
-            self.set_status(200)
-        except Exception as e:
-            logger.error(f"Error processing update: {e}")
-            self.set_status(500)
 
 # ---------- Topic IDs Cache ----------
 topic_cache = None
@@ -113,6 +133,13 @@ async def send_to_topic(context: ContextTypes.DEFAULT_TYPE, topic: str, text: st
     return await context.bot.send_message(
         chat_id=ADMIN_GROUP_ID, text=text, message_thread_id=topic_id, **kwargs
     )
+
+# ---------- Preloaded font ----------
+FONT = None
+try:
+    FONT = ImageFont.truetype("DejaVuSans.ttf", 20)
+except:
+    FONT = ImageFont.load_default()
 
 # ---------- Driver Keyboard ----------
 def get_driver_keyboard():
@@ -174,10 +201,6 @@ async def generate_order_number(conn):
 async def generate_order_png(order):
     img = Image.new('RGB', (600, 400), color=(255, 255, 255))
     d = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 20)
-    except:
-        font = ImageFont.load_default()
     lines = [
         "**COMMANDE**",
         f"Code: {order['code']}",
@@ -193,14 +216,15 @@ async def generate_order_png(order):
     ]
     y = 20
     for line in lines:
-        d.text((20, y), line, fill=(0, 0, 0), font=font)
+        d.text((20, y), line, fill=(0, 0, 0), font=FONT)
         y += 30
     buf = BytesIO()
     img.save(buf, format='PNG')
     buf.seek(0)
     return buf
 
-# ---------- Parse Article Code ----------
+# ---------- Article Code Parser (cached) ----------
+@lru_cache(maxsize=4096)
 def parse_article_code(code: str):
     parts = code.strip().split('-')
     if len(parts) != 4:
@@ -214,19 +238,84 @@ def parse_article_code(code: str):
         raise ValueError(f"Invalid form_size format: {form_size}")
     return collection, match.group(1).upper(), match.group(2), design, color_code
 
-# ---------- Single-message Bulk Import (/bulkadd) ----------
+# ---------- Batch article insertion ----------
+async def insert_articles_batch(conn, articles_data):
+    """articles_data is a list of tuples (code, collection, form, dimensions, design, color_code, color_name, price)."""
+    async with conn.transaction():
+        await conn.executemany(
+            """INSERT INTO articles (code, collection, form, dimensions, design, color_code, color_name, price)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+               ON CONFLICT (code) DO UPDATE SET
+                   collection = EXCLUDED.collection, form = EXCLUDED.form,
+                   dimensions = EXCLUDED.dimensions, design = EXCLUDED.design,
+                   color_code = EXCLUDED.color_code, color_name = EXCLUDED.color_name,
+                   price = EXCLUDED.price""",
+            articles_data
+        )
+
+# ---------- Excel Processing ----------
+async def process_catalogue_excel(context: ContextTypes.DEFAULT_TYPE, file_bytes: bytes):
+    db = await get_db_pool()
+    successes, errors = 0, []
+    batch = []
+    wb = openpyxl.load_workbook(BytesIO(file_bytes))
+    ws = wb.active
+
+    # Load color cache if empty (should already be loaded at startup)
+    if not COLOR_CACHE:
+        await load_color_cache()
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or len(row) < 2:
+            continue
+        code_raw, price_raw = str(row[0]).strip(), row[1]
+        if not code_raw or price_raw is None:
+            continue
+        try:
+            price = float(price_raw)
+            if price < 0:
+                errors.append(f"{code_raw}: prix négatif")
+                continue
+        except:
+            errors.append(f"{code_raw}: prix invalide")
+            continue
+        try:
+            collection, form, dimensions, design, color_code = parse_article_code(code_raw)
+        except Exception as e:
+            errors.append(f"{code_raw}: {str(e)}")
+            continue
+        color_name = get_color_name(color_code)
+        if not color_name:
+            errors.append(f"{code_raw}: couleur inconnue ({color_code})")
+            continue
+        batch.append((code_raw, collection, form, dimensions, design, color_code, color_name, price))
+
+    if batch:
+        async with db.acquire() as conn:
+            try:
+                await insert_articles_batch(conn, batch)
+                successes = len(batch)
+            except Exception as e:
+                logger.error(f"Batch insert failed: {e}")
+                errors.append("Batch insert failed, check logs")
+                successes = 0
+
+    result_text = f"📤 Import catalogue terminé.\n✅ {successes} articles"
+    if errors:
+        result_text += f"\n❌ {len(errors)} erreurs:\n" + "\n".join(errors[:10])
+    await send_to_topic(context, "logs", result_text)
+
+# ---------- Bulk Add (single message) ----------
 async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process /bulkadd with the article list in the same message."""
-    if not await admin_only(update):
+    if not await is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Only admins can use this command.")
         return
 
-    # Get the text after the command
     text = update.message.text.split(' ', 1)
     if len(text) < 2:
         await update.message.reply_text(
             "📋 Usage: /bulkadd followed by lines of CODE PRICE\n"
-            "Example:\n/bulkadd\nAKSARAY-C80X2000-0000-0 29000\nAKSARAY-O160X220-0000-0 6550"
+            "Example:\n/bulkadd\nAKSARAY-C80X2000-0000-0 29000"
         )
         return
 
@@ -236,15 +325,11 @@ async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No lines found.")
         return
 
-    db = await get_db_pool()
-    successes, errors = 0, []
-    color_map = {}
+    if not COLOR_CACHE:
+        await load_color_cache()
 
-    async with db.acquire() as conn:
-        colors = await conn.fetch("SELECT code, name FROM color_codes")
-        for c in colors:
-            color_map[c['code']] = c['name']
-
+    batch = []
+    errors = []
     for line in lines:
         line = line.strip()
         if not line:
@@ -253,8 +338,7 @@ async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) < 2:
             errors.append(f"Invalid line: {line}")
             continue
-        code_raw = parts[0]
-        price_raw = parts[1]
+        code_raw, price_raw = parts[0], parts[1]
         try:
             price = float(price_raw)
             if price < 0:
@@ -268,22 +352,18 @@ async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             errors.append(f"{code_raw}: {str(e)}")
             continue
-        color_name = color_map.get(color_code)
+        color_name = get_color_name(color_code)
         if not color_name:
             errors.append(f"{code_raw}: unknown color {color_code}")
             continue
+        batch.append((code_raw, collection, form, dimensions, design, color_code, color_name, price))
+
+    successes = 0
+    if batch:
+        db = await get_db_pool()
         async with db.acquire() as conn:
-            await conn.execute(
-                """INSERT INTO articles (code, collection, form, dimensions, design, color_code, color_name, price)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                   ON CONFLICT (code) DO UPDATE SET
-                       collection = EXCLUDED.collection, form = EXCLUDED.form,
-                       dimensions = EXCLUDED.dimensions, design = EXCLUDED.design,
-                       color_code = EXCLUDED.color_code, color_name = EXCLUDED.color_name,
-                       price = EXCLUDED.price""",
-                code_raw, collection, form, dimensions, design, color_code, color_name, price
-            )
-        successes += 1
+            await insert_articles_batch(conn, batch)
+            successes = len(batch)
 
     result = f"📤 Bulk import complete.\n✅ {successes} articles"
     if errors:
@@ -291,15 +371,11 @@ async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(result)
     await send_to_topic(context, "logs", result)
 
-# ---------- Admin check ----------
+# ---------- Admin check helper (using cache) ----------
 async def admin_only(update: Update):
-    try:
-        member = await update.get_bot().get_chat_member(ADMIN_GROUP_ID, update.effective_user.id)
-        return member.status in ('administrator', 'creator')
-    except:
-        return False
+    return await is_admin(update.effective_user.id)
 
-# ---------- Driver Registration ----------
+# ---------- Driver Registration (unchanged, but uses admin_only) ----------
 REG_NAME, REG_VEHICLE = range(2)
 
 async def start_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -363,7 +439,7 @@ async def cancel_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not await admin_only(update):
+    if not await is_admin(query.from_user.id):
         await query.answer("Non autorisé.")
         return
     action, target_id_str = query.data.split('_', 1)
@@ -397,7 +473,7 @@ async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
 
-# ---------- Search Functions ----------
+# ---------- Search Functions (unchanged) ----------
 async def search_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db = await get_db_pool()
@@ -475,7 +551,7 @@ async def receive_search_term(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Résultats pour « {term} »:", reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
-# ---------- Order Flow ----------
+# ---------- Order Flow (unchanged) ----------
 async def select_article(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -656,7 +732,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
     await update.message.reply_text(f"Diffusion: {sent} envoyés, {failed} échecs.")
 
-# ---------- /addarticle Conversation ----------
+# ---------- /addarticle Conversation (with admin cache) ----------
 ADD_COLLECTION, ADD_FORM, ADD_DIMENSIONS, ADD_DESIGN, ADD_COLOR, ADD_PRICE = range(6)
 
 async def add_article_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -691,14 +767,12 @@ async def add_design(update, context):
 
 async def add_color(update, context):
     color_code = update.message.text.strip()
-    db = await get_db_pool()
-    async with db.acquire() as conn:
-        color = await conn.fetchrow("SELECT name FROM color_codes WHERE code = $1", color_code)
-        if not color:
-            await update.message.reply_text("Couleur inconnue. Ajoutez-la d'abord. Réessayez:")
-            return ADD_COLOR
+    color_name = get_color_name(color_code)
+    if not color_name:
+        await update.message.reply_text("Couleur inconnue. Ajoutez-la d'abord. Réessayez:")
+        return ADD_COLOR
     context.user_data['add_art']['color_code'] = color_code
-    context.user_data['add_art']['color_name'] = color['name']
+    context.user_data['add_art']['color_name'] = color_name
     await update.message.reply_text("Prix (DZD):")
     return ADD_PRICE
 
@@ -734,9 +808,41 @@ async def cancel_add(update, context):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
-# ---------- Main (webhook + health endpoint) ----------
+# ---------- Health endpoint ----------
+class HealthHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.set_status(200)
+        self.write("OK")
+
+# ---------- Custom webhook handler ----------
+class WebhookHandler(tornado.web.RequestHandler):
+    def initialize(self, app: Application, webhook_url: str) -> None:
+        self.app = app
+        self.webhook_url = webhook_url
+
+    async def post(self) -> None:
+        try:
+            body = self.request.body
+            if not body:
+                self.set_status(400)
+                return
+            data = json.loads(body)
+            update = Update.de_json(data, self.app.bot)
+            asyncio.ensure_future(self.app.process_update(update))
+            self.set_status(200)
+        except Exception as e:
+            logger.error(f"Error processing update: {e}")
+            self.set_status(500)
+
+# ---------- Main ----------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Load color cache asynchronously after bot is initialized
+    async def post_init(app):
+        await load_color_cache()
+
+    app.post_init = post_init
 
     # --- Register all handlers ---
     reg_conv = ConversationHandler(
@@ -777,10 +883,10 @@ def main():
     app.add_handler(CommandHandler("toggleavail", toggle_avail, filters.Chat(ADMIN_GROUP_ID)))
     app.add_handler(CommandHandler("removearticle", remove_article, filters.Chat(ADMIN_GROUP_ID)))
     app.add_handler(CommandHandler("broadcast", broadcast, filters.Chat(ADMIN_GROUP_ID)))
+    app.add_handler(CommandHandler("bulkadd", bulk_add, filters.Chat(ADMIN_GROUP_ID)))
     async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("pong")
     app.add_handler(CommandHandler("ping", ping, filters.Chat(ADMIN_GROUP_ID)))
-    app.add_handler(CommandHandler("bulkadd", bulk_add, filters.Chat(ADMIN_GROUP_ID)))
 
     # Callback handlers
     app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^(approve_|reject_)"))
