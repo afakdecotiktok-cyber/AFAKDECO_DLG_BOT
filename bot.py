@@ -176,7 +176,6 @@ async def send_and_pin_new(context, conn, drivers_topic, text):
         chat_id=ADMIN_GROUP_ID, text=text, parse_mode='Markdown', message_thread_id=drivers_topic
     )
     # Pinning is skipped because PTB 20.7 does not support message_thread_id in pin_chat_message
-    # We simply send the message without pinning it (the list will still appear in the topic)
     await conn.execute(
         "UPDATE group_settings SET drivers_list_msg_id = $1 WHERE group_id = $2",
         msg.message_id, ADMIN_GROUP_ID
@@ -249,13 +248,63 @@ async def insert_articles_batch(conn, articles_data):
             articles_data
         )
 
+# ---------- Excel Processing ----------
+async def process_catalogue_excel(context: ContextTypes.DEFAULT_TYPE, file_bytes: bytes):
+    db = await get_db_pool()
+    successes, errors = 0, []
+    batch = []
+    wb = openpyxl.load_workbook(BytesIO(file_bytes))
+    ws = wb.active
+
+    if not COLOR_CACHE:
+        await load_color_cache()
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or len(row) < 2:
+            continue
+        code_raw, price_raw = str(row[0]).strip(), row[1]
+        if not code_raw or price_raw is None:
+            continue
+        try:
+            price = float(price_raw)
+            if price < 0:
+                errors.append(f"{code_raw}: prix négatif")
+                continue
+        except:
+            errors.append(f"{code_raw}: prix invalide")
+            continue
+        try:
+            collection, form, dimensions, design, color_code = parse_article_code(code_raw)
+        except Exception as e:
+            errors.append(f"{code_raw}: {str(e)}")
+            continue
+        color_name = get_color_name(color_code)
+        if not color_name:
+            errors.append(f"{code_raw}: couleur inconnue ({color_code})")
+            continue
+        batch.append((code_raw, collection, form, dimensions, design, color_code, color_name, price))
+
+    if batch:
+        async with db.acquire() as conn:
+            try:
+                await insert_articles_batch(conn, batch)
+                successes = len(batch)
+            except Exception as e:
+                logger.error(f"Batch insert failed: {e}")
+                errors.append("Batch insert failed, check logs")
+                successes = 0
+
+    result_text = f"📤 Import catalogue terminé.\n✅ {successes} articles"
+    if errors:
+        result_text += f"\n❌ {len(errors)} erreurs:\n" + "\n".join(errors[:10])
+    await send_to_topic(context, "logs", result_text)
+
 # ---------- Bulk Add (single message) ----------
 async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update):
         await update.message.reply_text("⛔ Only admins can use this command.")
         return
 
-    # Ensure color cache is loaded
     if not COLOR_CACHE:
         await load_color_cache()
 
@@ -315,6 +364,23 @@ async def bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result += f"\n❌ {len(errors)} errors:\n" + "\n".join(errors[:10])
     await update.message.reply_text(result)
     await send_to_topic(context, "logs", result)
+
+# ---------- Excel Upload Handler ----------
+async def handle_excel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        await update.message.reply_text("⛔ Only admins can upload files.")
+        return
+    doc = update.message.document
+    if not doc:
+        return
+    file_name = doc.file_name or ""
+    if not file_name.lower().endswith(".xlsx"):
+        await update.message.reply_text("❌ Only .xlsx files are accepted.")
+        return
+    await update.message.reply_text("🔄 Processing file...")
+    file = await doc.get_file()
+    file_bytes = await file.download_as_bytearray()
+    await process_catalogue_excel(context, file_bytes)
 
 # ---------- Driver Registration ----------
 REG_NAME, REG_VEHICLE = range(2)
@@ -491,7 +557,7 @@ async def receive_search_term(update, context):
         await update.message.reply_text(f"Résultats pour « {term} »:", reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
-# ---------- Order Flow (unchanged) ----------
+# ---------- Order Flow ----------
 async def select_article(update, context):
     query = update.callback_query
     await query.answer()
@@ -777,7 +843,6 @@ class WebhookHandler(tornado.web.RequestHandler):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Handlers registration
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start_driver, filters.ChatType.PRIVATE)],
         states={
@@ -825,9 +890,15 @@ def main():
     app.add_handler(CallbackQueryHandler(confirm_order, pattern="^confirm_order$"))
     app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_order$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_quantity))
+
+    # Excel upload handler (accepts .xlsx files in the admin group)
+    app.add_handler(MessageHandler(
+        filters.Document.FileExtension("xlsx") & filters.Chat(ADMIN_GROUP_ID),
+        handle_excel_upload
+    ))
+
     app.add_error_handler(error_handler)
 
-    # Webhook setup with health check and color cache preloading
     port = int(os.environ.get("PORT", "10000"))
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
 
@@ -845,7 +916,6 @@ def main():
 
     async def start():
         await app.initialize()
-        # Load colors before accepting updates
         await load_color_cache()
         await app.bot.set_webhook(url=webhook_url)
         server = tornado.httpserver.HTTPServer(tornado_app)
