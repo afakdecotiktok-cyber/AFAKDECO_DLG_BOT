@@ -148,7 +148,7 @@ def init_db():
         conn.commit()
 
 # ----------------------------------------------------------------------
-# Cached vehicle status (fixed last_vid initialization)
+# Cached vehicle status (fixed last_vid)
 # ----------------------------------------------------------------------
 vehicle_cache = {}
 cache_dirty = set()
@@ -161,7 +161,7 @@ def refresh_cache(vehicle: str):
     with db_connection() as conn:
         cur = conn.cursor()
         last_km = None
-        last_vid = 0                     # initialize to avoid UnboundLocalError
+        last_vid = 0
         cur.execute("SELECT COUNT(*) FROM problems WHERE vehicle=%s AND status='قيد الانتظار' AND ruglee != 'تم الإصلاح'", (vehicle,))
         if cur.fetchone()[0] > 0:
             status = 'bad'
@@ -503,7 +503,7 @@ def dashboard_button_text(vehicle: str) -> str:
     cnt = count_open_problems_cached(vehicle)
     rem = get_remaining_km_cached(vehicle)
     line1 = f"{emoji} {vehicle} ({cnt})"
-    line2 = f"   {rem} كم" if rem is not None else "   —"
+    line2 = f"   {rem}" if rem is not None else "   —"   # No "كم"
     return f"{line1}\n{line2}"
 
 def admin_main_keyboard() -> InlineKeyboardMarkup:
@@ -1423,21 +1423,33 @@ async def delete_help_video_callback(update: Update, context: ContextTypes.DEFAU
     delete_help_video(video_id)
     await query.edit_message_text("✅ تم حذف الفيديو.")
 
-# Broadcast command (super admin only)
+# ----------------------------------------------------------------------
+# Improved Broadcast command (with detailed report)
+# ----------------------------------------------------------------------
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     if not context.args:
         await update.message.reply_text("استخدم: /broadcast <النص>")
         return
+
     message = " ".join(context.args)
     drivers = get_all_drivers()
-    count = 0
+    if not drivers:
+        await update.message.reply_text("لا يوجد سائقون مسجلون.")
+        return
+
+    success = 0
+    failed = 0
     for d in drivers:
         try:
             await context.bot.send_message(chat_id=d["user_id"], text=message)
-            count += 1
-        except: pass
-    await update.message.reply_text(f"تم إرسال الرسالة إلى {count} سائق.")
+            success += 1
+        except Exception as e:
+            logging.warning(f"Broadcast failed for {d['user_id']}: {e}")
+            failed += 1
+
+    await update.message.reply_text(f"✅ تم إرسال الرسالة إلى {success} سائق.\n❌ فشل الإرسال إلى {failed}.")
 
 # ----------------------------------------------------------------------
 # Dashboard functions (fixed to use thread_id from calling message)
