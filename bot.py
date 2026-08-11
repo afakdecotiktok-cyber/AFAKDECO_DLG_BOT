@@ -162,6 +162,7 @@ def refresh_cache(vehicle: str):
         cur = conn.cursor()
         last_km = None
         last_vid = 0
+        # Check open "قيد الانتظار" problems first
         cur.execute("SELECT COUNT(*) FROM problems WHERE vehicle=%s AND status='قيد الانتظار' AND ruglee != 'تم الإصلاح'", (vehicle,))
         if cur.fetchone()[0] > 0:
             status = 'bad'
@@ -503,7 +504,8 @@ def dashboard_button_text(vehicle: str) -> str:
     cnt = count_open_problems_cached(vehicle)
     rem = get_remaining_km_cached(vehicle)
     line1 = f"{emoji} {vehicle} ({cnt})"
-    line2 = f"   {rem}" if rem is not None else "   —"   # No "كم"
+    # No "كم", just the number or "--"
+    line2 = f"   {rem}" if rem is not None else "   —"
     return f"{line1}\n{line2}"
 
 def admin_main_keyboard() -> InlineKeyboardMarkup:
