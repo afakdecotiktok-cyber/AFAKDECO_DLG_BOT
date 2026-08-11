@@ -148,7 +148,7 @@ def init_db():
         conn.commit()
 
 # ----------------------------------------------------------------------
-# Cached vehicle status (FIX: last_vid initialized)
+# Cached vehicle status (fixed last_vid initialization)
 # ----------------------------------------------------------------------
 vehicle_cache = {}
 cache_dirty = set()
@@ -161,7 +161,7 @@ def refresh_cache(vehicle: str):
     with db_connection() as conn:
         cur = conn.cursor()
         last_km = None
-        last_vid = 0                     # <-- FIX: initialize before any branch
+        last_vid = 0                     # initialize to avoid UnboundLocalError
         cur.execute("SELECT COUNT(*) FROM problems WHERE vehicle=%s AND status='قيد الانتظار' AND ruglee != 'تم الإصلاح'", (vehicle,))
         if cur.fetchone()[0] > 0:
             status = 'bad'
@@ -169,7 +169,7 @@ def refresh_cache(vehicle: str):
             cur.execute("SELECT km FROM km_readings WHERE vehicle=%s ORDER BY date DESC LIMIT 1", (vehicle,))
             row = cur.fetchone()
             last_km = row[0] if row else None
-            last_vid = get_last_vidange_km_noconn(conn, vehicle)   # overwrite 0
+            last_vid = get_last_vidange_km_noconn(conn, vehicle)
             if last_km and last_vid > 0 and last_km >= last_vid + 9000:
                 status = 'bad'
             else:
@@ -417,7 +417,7 @@ def remove_driver(user_id: int):
         conn.commit()
 
 # ----------------------------------------------------------------------
-# Excel generation (unchanged)
+# Excel generation
 # ----------------------------------------------------------------------
 def generate_problems_excel() -> BytesIO:
     problems = get_all_problems()
@@ -659,7 +659,7 @@ async def cancel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("تم الإلغاء.")
 
 # ----------------------------------------------------------------------
-# Core handlers (start, handle_text, handle_media)
+# Core handlers
 # ----------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -849,7 +849,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("expecting_km")
         add_km_reading(vehicle, km, driver_name=driver["name"])
         last_vid = get_last_vidange_km(vehicle)
-        # Create vidange problem if km >= last_vid + 9000 and no active vidange problem
+        # Create vidange problem at +9000
         if last_vid > 0 and km >= last_vid + 9000 and not has_active_vidange(vehicle):
             vidange_problem_id = add_problem(user_id, f"{driver['name']} (نظام)", vehicle, f"Vidange {vehicle}", "نظام")
             await context.bot.send_message(
@@ -857,7 +857,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"⚠️ تنبيه فيدانج: المركبة {vehicle}\nالعداد الحالي: {km} كم\nآخر فيدانج: {last_vid} كم\n🔴 الحالة: قيد الانتظار",
                 reply_markup=build_problem_keyboard(vidange_problem_id)
             )
-        # Additional urgent notification if km >= last_vid + 9500 (even if problem exists)
+        # Urgent notification at +9500
         if last_vid > 0 and km >= last_vid + 9500:
             await context.bot.send_message(
                 chat_id=ADMIN_GROUP_ID, message_thread_id=TOPIC_VIDANGE,
@@ -902,7 +902,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("تم إرسال الشكوى.", reply_markup=MAIN_KEYBOARD)
 
 # ----------------------------------------------------------------------
-# Callback handlers (all fixed)
+# Callback handlers (fixed)
 # ----------------------------------------------------------------------
 async def vehicle_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1440,7 +1440,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"تم إرسال الرسالة إلى {count} سائق.")
 
 # ----------------------------------------------------------------------
-# Dashboard functions (with TOPIC_GENERAL always for scheduled/button)
+# Dashboard functions (fixed to use thread_id from calling message)
 # ----------------------------------------------------------------------
 async def _send_dashboard(chat_id: int, thread_id: int = None):
     vehicles = get_all_vehicles()
@@ -1468,7 +1468,10 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_dash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await _send_dashboard(ADMIN_GROUP_ID, TOPIC_GENERAL)
+    thread_id = query.message.message_thread_id if query.message else None
+    if not thread_id:
+        thread_id = TOPIC_GENERAL
+    await _send_dashboard(ADMIN_GROUP_ID, thread_id)
     await query.edit_message_text("تم إرسال لوحة القيادة.")
 
 async def scheduled_dashboard(context: ContextTypes.DEFAULT_TYPE):
@@ -1706,7 +1709,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(comment_callback, pattern="^com_"))
     app.add_handler(CallbackQueryHandler(delete_callback, pattern="^del_"))
     app.add_handler(CallbackQueryHandler(confirm_delete_callback, pattern="^confirmdel_"))
-    app.add_handler(CallbackQueryHandler(cancel_delete_callback, pattern="^cancel_"))  # no $
+    app.add_handler(CallbackQueryHandler(cancel_delete_callback, pattern="^cancel_"))
     app.add_handler(CallbackQueryHandler(validation_request_callback, pattern="^valreq_"))
     app.add_handler(CallbackQueryHandler(valrug_callback, pattern="^valrug_"))
     app.add_handler(CallbackQueryHandler(close_val_callback, pattern="^close_val_"))
