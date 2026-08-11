@@ -148,7 +148,7 @@ def init_db():
         conn.commit()
 
 # ----------------------------------------------------------------------
-# Cached vehicle status (updated for vidange thresholds)
+# Cached vehicle status (FIX: last_vid initialized)
 # ----------------------------------------------------------------------
 vehicle_cache = {}
 cache_dirty = set()
@@ -161,6 +161,7 @@ def refresh_cache(vehicle: str):
     with db_connection() as conn:
         cur = conn.cursor()
         last_km = None
+        last_vid = 0                     # <-- FIX: initialize before any branch
         cur.execute("SELECT COUNT(*) FROM problems WHERE vehicle=%s AND status='قيد الانتظار' AND ruglee != 'تم الإصلاح'", (vehicle,))
         if cur.fetchone()[0] > 0:
             status = 'bad'
@@ -168,8 +169,7 @@ def refresh_cache(vehicle: str):
             cur.execute("SELECT km FROM km_readings WHERE vehicle=%s ORDER BY date DESC LIMIT 1", (vehicle,))
             row = cur.fetchone()
             last_km = row[0] if row else None
-            last_vid = get_last_vidange_km_noconn(conn, vehicle)
-            # Red if km >= last_vid + 9000 (early warning threshold)
+            last_vid = get_last_vidange_km_noconn(conn, vehicle)   # overwrite 0
             if last_km and last_vid > 0 and last_km >= last_vid + 9000:
                 status = 'bad'
             else:
@@ -659,7 +659,7 @@ async def cancel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("تم الإلغاء.")
 
 # ----------------------------------------------------------------------
-# Core handlers
+# Core handlers (start, handle_text, handle_media)
 # ----------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -902,7 +902,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("تم إرسال الشكوى.", reply_markup=MAIN_KEYBOARD)
 
 # ----------------------------------------------------------------------
-# Callback handlers (with fixed cancel pattern and repair logic)
+# Callback handlers (all fixed)
 # ----------------------------------------------------------------------
 async def vehicle_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
